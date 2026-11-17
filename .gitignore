@@ -1,0 +1,31 @@
+# Build output
+output/
+*.o
+*.a
+*.bit
+*.config
+*.json.tmp
+
+# Simulation
+*.vcd
+*.fst
+*.vvp
+obj_dir/
+
+# Disk and card images, and the copies the lockstep runs make
+*.img
+*.img.rtl
+*.iso
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors and operating systems
+*~
+*.swp
+*.orig
+*.rej
+.DS_Store
+.vscode/
+.idea/

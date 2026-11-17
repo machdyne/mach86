@@ -1,0 +1,45 @@
+name: ci
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y nasm verilator iverilog
+      - run: make check
+  vectors:
+    # About 580 MB of test vectors, and third-party DOS files: weekly and
+    # on request, not per push.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y nasm verilator yosys nextpnr-ecp5
+      - run: tools/fetch_vectors.sh
+      - run: make vectors
+      - run: make rtl-vectors
+      - run: make vectors-b
+      - run: make dhry-b
+      - run: tools/fetch_dos.sh
+      - run: make dos
+      - run: make rtl-dos
+      - run: make dos-b
+      - run: make soc-dos
+      - run: make check-soc-main
+      - run: sudo apt-get install -y dosfstools mtools genisoimage
+      - run: make check-card
+      - run: make check-gate
+      - run: make synth
+      - run: make synth-b
+      # The board bitstream needs newer tools than Ubuntu's: nextpnr 0.6
+      # crashes on the design with the DDR3 PHY. This is the release
+      # Zeitlos builds with.
+      - run: |
+          curl -sSL -o /tmp/oss.tgz https://github.com/YosysHQ/oss-cad-suite-build/releases/download/2026-10-01/oss-cad-suite-linux-x64-20261001.tgz
+          tar -C /tmp -xzf /tmp/oss.tgz
+          PATH=/tmp/oss-cad-suite/bin:$PATH make sergei_ml2

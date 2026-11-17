@@ -1,0 +1,51 @@
+# Known deviations of the reference model from the 386 real-mode vectors.
+#
+# Each line is the hash of one test, then where it is and what it runs.
+# sim/vectest -k reads this file: a listed test may fail, and it is an
+# error if a listed test passes (the list must then be shortened).
+#
+# Generated with: vectest -H ... (see docs/model.md).
+
+# AAM with a zero divisor. The divide fault is taken as expected, but the
+# flags image it pushes differs: the manual leaves those flags undefined and
+# the hardware's values follow no rule we have found.
+6b00e0df24d4e7b0ce6ed4f679ff281d79a956f9  D4.MOO.gz #56 aam 0
+caba701ba68505fee6e08211ac8552616247d93a  D4.MOO.gz #722 aam 0
+ea4adfbaf2e2cf0688b6af05d01a3e8eb805695b  D4.MOO.gz #787 aam 0
+0b95793c7af6a3ff1d743192522f804bfa2171ec  D4.MOO.gz #1049 aam 0
+6f787529179973f826f8f037d81935cddad3a0a9  D4.MOO.gz #1220 aam 0
+6486142b75f8845fe3cb4b462c62b4ef11070134  D4.MOO.gz #1492 aam 0
+50eaa6eed86e0b65ab79fde5cb4c8462824d32f5  D4.MOO.gz #1699 aam 0
+6eac1c2aae3786f4bcd060b48847126a75a5d744  D4.MOO.gz #1813 aam 0
+c320e2d1ddd327db36854f5e0b8320cd24902bd4  D4.MOO.gz #1905 aam 0
+f3b8b0bc0c728919bf44964e6c7f8d6d4d8da009  D4.MOO.gz #2024 aam 0
+
+# IN from a port with nothing on it. The capture rig's bus floated to a
+# value other than all ones.
+29c9c6b39824411334d44d57db62504bb4807fc6  66E5.MOO.gz #190 in eax,1Fh
+ab010dbcc86182e4ce40933f61f0864ddfd38bab  66E5.MOO.gz #254 in eax,1Fh
+f9d9686381f6845b06163938406074037c1768a2  66E5.MOO.gz #340 in eax,1Fh
+c923d58b0eca0d62696e03e56c9fd46ae645bee6  66E5.MOO.gz #348 in eax,1Fh
+62f9cffa058135d552793d2e2505fc93e353ffad  66E5.MOO.gz #422 in eax,21h
+4fb5d80f331625dd650d55e8a1ab9d1da3b38784  E5.MOO.gz #422 in ax,21h
+
+# IDIV with a byte divisor. The quotient does not fit and the manual calls
+# for a divide fault; the hardware returns a quotient of 80h without
+# faulting. Not understood. Software cannot rely on it.
+c30147a2fb7f67459cb7a1a4c888b670edd838f5  67F6.7.MOO.gz #375 idiv cl
+8bddec44e46b709759d5d1550cd9fa16ab8e89fc  67F6.7.MOO.gz #460 idiv byte [ds:edx+46h]
+a06745936bac371e6afb861b5bc87be4b2dd676e  67F6.7.MOO.gz #516 idiv cl
+8813025dcf45588bd5141eb4d7081c67d6cf3ec3  F6.7.MOO.gz #469 idiv byte [ds:di-1F4h]
+c6d731127bec724d40594edc28a6ad8fdf14acbc  F6.7.MOO.gz #516 idiv cl
+c1392c8316c2d0532d80fb1fcb78832533093e4e  F6.7.MOO.gz #850 idiv byte [ds:3F74h]
+b674afe8d525fdf51217456b4a3f0b9102350cc4  F6.7.MOO.gz #1265 idiv byte [es:bx-5281h]
+13e7537c7cd00f676d17da613b4289afb93b338d  F6.7.MOO.gz #1754 idiv byte [ds:bx+di+BB0h]
+a4a926d8bbca1f281b0a479fd8c79fe3231bad34  F6.7.MOO.gz #2348 idiv byte [ds:407h]
+
+# REP MOVS/STOS that overwrites its own instruction bytes and the HLT that
+# ends the test. The hardware runs the bytes it had already prefetched;
+# the model has no prefetch queue. See docs/model.md.
+83e700d32ec2f8b24b2d6868508f6f035622497a  6766A5.MOO.gz #442 a32 es rep movsd
+6b2abc067357767515f08c87818ee8164e3110b7  6766AB.MOO.gz #458 a32 rep stosd
+d8b3564f727b41848d9e0e243363bf05a45cf078  67A5.MOO.gz #442 a32 es rep movsw
+82e4dc7d0031b8d567e3146c754acbad3287c3de  67AB.MOO.gz #458 a32 rep stosw
