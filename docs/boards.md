@@ -1,7 +1,9 @@
 # Boards
 
-Two boards are supported. Mach86 keeps its own board list and does
-not aim to run on everything Zeitlos does. Facts about them are taken from Zeitlos
+Two boards are supported, Lakritz and Sergei ML2, and four more
+have build rules that have never been run
+([Konfekt and Mozart](#konfekt-and-mozart)). Mach86 keeps its own
+board list and does not aim to run on everything Zeitlos does. Facts about them are taken from Zeitlos
 (`release/hw/boards/*.spec` and `docs/boards.md` at commit `ede46a8`).
 
 | | Lakritz | Sergei ML2 |
@@ -184,3 +186,49 @@ The DDR3 controller does not run on the CPU's clock. Its PHY makes a
 controller, and the two must stay in step; the CPU's clock comes
 from another PLL and is whatever the core routes at. Requests cross
 between the two in `rtl/soc/m86_xclk.v` ([soc.md](soc.md#the-main-memory)).
+
+## Konfekt and Mozart
+
+Four more boards have build rules, constraint files and nothing
+else: **none has been built into a bitstream, and none has run.**
+What was checked is that each design elaborates and that every port
+of its top level has a pin in its constraint file and the other way
+round. Each is one of the two builds above with another constraint
+file and a few switches.
+
+| | Konfekt | Mozart ML0 | Mozart ML1 | Mozart ML2 |
+|---|---|---|---|---|
+| FPGA | ECP5 12F | ECP5 25F | ECP5 45F | ECP5 45F |
+| Memory | 32 MB SDRAM | 32 MB SDRAM | 32 MB SDRAM | 512 MB DDR3L |
+| Built as | Lakritz | Lakritz | Lakritz | Sergei ML2 |
+| Sound | Sigma-delta pins, HDMI | PT8211 DAC, HDMI | PT8211 DAC, HDMI | PT8211 DAC, HDMI |
+| Serial console | No | Yes | Yes | Yes |
+| Constraints | `boards/konfekt.lpf` | `boards/mozart_ml1.lpf` | `boards/mozart_ml1.lpf` | `boards/mozart_ml2.lpf` |
+| Build | `make konfekt` | `make mozart_ml0` | `make mozart_ml1` | `make mozart_ml2` |
+
+The pins are Zeitlos's (`boards/konfekt_v0.lpf`, `mozart_ml1.lpf`,
+`mozart_ml2.lpf` there), trimmed to what Mach86 uses. Mozart ML0 is
+the ML1's ball map on the smaller FPGA. Mozart ML2 is the Sechzig
+ML2 module that Sergei ML2 has, in another carrier: its constraint
+file is Sergei's with the sound's pins changed, and Zeitlos's file
+agrees with it on every other pin used.
+
+What to expect, and what is not known:
+
+- **Konfekt may not fit.** The Lakritz build is 17,300 logic cells
+  and all 56 block RAMs of a 25F. A 12F is the same package with
+  half the logic and, by its data sheet, fewer block RAMs; whether
+  the tools accept this design for it has not been tried. If they
+  do not, something has to come out of the Konfekt build.
+- **Mozart ML0 is Lakritz's design** on the same FPGA with other
+  pins, and should build as Lakritz does. Mozart ML1 has the 45F's
+  room but is built with Lakritz's small cache and no block RAM
+  video memory; that is a setting to change once it runs.
+- **The PT8211 output** (`rtl/soc/m86_pt8211.v`) is new and tested
+  only in simulation, by a receiver that knows the DAC's rule
+  (`make check-tb`). Its scheme is Zeitlos's, which runs on these
+  boards.
+- The Konfekt's second USB port has pull-downs in Zeitlos's file and
+  the first has not; both are used as on Lakritz, a keyboard on one
+  and a mouse on the other.
+

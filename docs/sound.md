@@ -111,7 +111,9 @@ each does. How the numbers are computed is ours.
   `AUDIO_R` N1 in Zeitlos's constraints). Built and tested here;
   on Lakritz since round 23
   ([boards.md](boards.md#lakritz-where-it-stands));
-- **the display's cable** (round 25, both boards): see below.
+- **the display's cable** (round 25, both boards): see below;
+- **a PT8211 DAC** (`rtl/soc/m86_pt8211.v`), for the Mozart boards:
+  simulated, not run ([boards.md](boards.md#konfekt-and-mozart)).
 
 ### Sound on the display's cable
 
@@ -148,9 +150,8 @@ gateware: with the switch off it must be DVI; with it on it must find
 every packet with good parity, the InfoFrames, 800 frames of a known
 sound sequence unbroken, at 48,000 a second by the clock
 regeneration numbers. `HDMI ON` and `OFF` run under DOS in
-`make check-card`. **Not tried on a display.** Zeitlos's output with
-the same scheduler and encoder is, and that is the reason to expect
-it to work.
+`make check-card`. **It works on a Sergei ML2** with the display it
+was tried on.
 
 Cost: about 600 LUTs.
 

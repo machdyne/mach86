@@ -23,7 +23,9 @@ Sergei ML2; **the Lakritz build has not run on a board yet.**
 
 The pins are in `boards/sergei_ml2.lpf` and `boards/lakritz.lpf`.
 The design is described in [soc.md](soc.md) and
-[boards.md](boards.md).
+[boards.md](boards.md), which also has the four boards whose builds
+exist and have never been tried: Konfekt and Mozart ML0, ML1 and
+ML2.
 
 **USB keyboards and mice must be low-speed devices** that speak the
 HID boot protocol. Most plain ones are; many gaming keyboards, and

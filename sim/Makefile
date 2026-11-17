@@ -442,6 +442,9 @@ check-tb:
 	iverilog -g2005 -o $(SOCOUT)/dvi_tb m86_dvi_tb.v ../rtl/soc/m86_dvi.v
 	vvp -n $(SOCOUT)/dvi_tb | tee $(SOCOUT)/dvi_tb.log | tail -n 1
 	grep -q "dvi: pass" $(SOCOUT)/dvi_tb.log
+	iverilog -g2005 -o $(SOCOUT)/pt8211_tb m86_pt8211_tb.v ../rtl/soc/m86_pt8211.v
+	vvp -n $(SOCOUT)/pt8211_tb | tee $(SOCOUT)/pt8211_tb.log | tail -n 2 | head -n 1
+	grep -q "pt8211: pass" $(SOCOUT)/pt8211_tb.log
 	iverilog -g2005 -o $(SOCOUT)/hdmi_tb m86_hdmi_tb.v ../rtl/soc/m86_hdmi.v \
 	  $(ZL)/ddmi_island.v $(ZL)/tmds_encoder.v
 	vvp -n $(SOCOUT)/hdmi_tb +out=$(SOCOUT)/hdmi0.txt +hdmi=0 | tail -n 1

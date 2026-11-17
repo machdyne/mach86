@@ -44,7 +44,8 @@ and shares its licence; a few vendored files have their own
   instruction, and the whole machine simulated down to its pins
   ([docs/verification.md](docs/verification.md)).
 - **Boards:** Sergei ML2 (ECP5 45F, DDR3; about 20,000 LUTs) and
-  Lakritz (ECP5 25F, SDRAM; about 17,000)
+  Lakritz (ECP5 25F, SDRAM; about 17,000). Build rules, so far
+  untried, for Konfekt and Mozart ML0, ML1 and ML2
   ([docs/boards.md](docs/boards.md)). Built with Yosys and nextpnr.
 
 ## Status
@@ -54,10 +55,10 @@ not there.
 
 | | |
 |---|---|
-| **Works on a Sergei ML2** | DOS boots from the card; the measured speed is what the simulation predicts (`SPEED` prints 21.4 million instructions a second on a plain loop at 33.16 MHz; 20.3 at 31.5 before); the display; DDR3 memory; PC speaker and AdLib sound right; the Monkey Island demo runs, with music, under `SLOW 5`; **DOOM's shareware episode runs** (round 26, at 33 MHz, about ten frames a second by eye, sound not yet tried) |
-| **Passes in simulation, not confirmed on a board** | Sound over HDMI; the 486 instructions and protected mode beyond what DOOM uses. Also the mouse, the 640 x 350 and 640 x 480 modes, and the whole Lakritz build. The USB keyboard has not been reported on either way |
+| **Works on a Sergei ML2** | DOS boots from the card; the measured speed is what the simulation predicts (`SPEED` prints 21.4 million instructions a second on a plain loop at 33.16 MHz; 20.3 at 31.5 before); the display; DDR3 memory; PC speaker and AdLib sound right, over HDMI too; the Monkey Island demo runs, with music, under `SLOW 5`; **DOOM's shareware episode runs** (round 26, at 33 MHz, about ten frames a second by eye, sound not yet tried) |
+| **Passes in simulation, not confirmed on a board** | The 486 instructions and protected mode beyond what DOOM uses. Also the mouse, the 640 x 350 and 640 x 480 modes, and the whole Lakritz build. The Konfekt and Mozart builds have not even been built into bitstreams. The USB keyboard has not been reported on either way |
 | **Not tested at all** | Any DOS extender but DOS/4GW, any protected-mode program but DOOM and our own tests |
-| **Not there** | Privilege levels, paging, virtual 8086 mode (so no EMM386, no Windows); an FPU; Sound Blaster; AdLib's rhythm mode; a mouse cursor in graphics modes |
+| **Not there yet** | Privilege levels, paging, virtual 8086 mode (so no EMM386, no Windows); an FPU; Sound Blaster; AdLib's rhythm mode; a mouse cursor in graphics modes |
 
 ## Goals
 
@@ -79,6 +80,7 @@ An FPU is not planned for now.
 ```
 make sergei_ml2        # output/sergei_ml2/mach86.bit
 make lakritz           # output/lakritz/mach86.bit
+make konfekt           # and mozart_ml0, mozart_ml1, mozart_ml2: untried
 tools/fetch_dos.sh     # FreeDOS and HimemX, fetched, not in the repository
 make card              # output/card/mach86-boot.img, the boot disk
 ```
@@ -130,10 +132,6 @@ files are third-party and are fetched, not committed
 `make rtl-vectors` and `make rtl-dos` run the same two things on the
 RTL core, and `make synth` reports its size
 ([docs/cpu.md](docs/cpu.md)).
-
-## LLM-generated code
-
-This project makes use of LLMs for code and documentation.
 
 ## License
 

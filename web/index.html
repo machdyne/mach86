@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mach86 — a 486-class PC on an FPGA, written from scratch</title>
+<meta name="description" content="Mach86 is a clean-room PC-compatible computer in plain Verilog. It boots DOS from an SD card and runs DOS software and games on small Lattice ECP5 boards.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://mach86.org/">
+<meta property="og:title" content="Mach86 — a 486-class PC on an FPGA">
+<meta property="og:description" content="A clean-room PC-compatible computer in plain Verilog: its own CPU, BIOS, VGA, sound and USB input. Boots FreeDOS on Lattice ECP5.">
+<meta property="og:image" content="https://mach86.org/img/monkey-island.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0a0c12">
+<style>
+@font-face{font-family:"VT323";src:url(fonts/vt323-latin-400-normal.woff2) format("woff2");font-weight:400;font-display:swap}
+@font-face{font-family:"IBM Plex Sans";src:url(fonts/ibm-plex-sans-latin-400-normal.woff2) format("woff2");font-weight:400;font-display:swap}
+@font-face{font-family:"IBM Plex Sans";src:url(fonts/ibm-plex-sans-latin-500-normal.woff2) format("woff2");font-weight:500;font-display:swap}
+@font-face{font-family:"IBM Plex Sans";src:url(fonts/ibm-plex-sans-latin-600-normal.woff2) format("woff2");font-weight:600;font-display:swap}
+@font-face{font-family:"IBM Plex Mono";src:url(fonts/ibm-plex-mono-latin-400-normal.woff2) format("woff2");font-weight:400;font-display:swap}
+@font-face{font-family:"IBM Plex Mono";src:url(fonts/ibm-plex-mono-latin-500-normal.woff2) format("woff2");font-weight:500;font-display:swap}
+
+:root{
+  --bg:#0a0c12; --bg2:#0f121b; --panel:#131724; --line:#232a3c; --line2:#2f3850;
+  --text:#d8dce6; --muted:#8c94a8; --dim:#5d6578;
+  /* the VGA/EGA bright palette */
+  --cyan:#55ffff; --magenta:#ff55ff; --yellow:#ffff55; --green:#55ff55; --blue:#5555ff; --red:#ff5555; --white:#ffffff;
+  --pixel:"VT323", ui-monospace, monospace;
+  --mono:"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans:"IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --max:1120px;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font:400 17px/1.65 var(--sans);-webkit-font-smoothing:antialiased;
+  background-image:radial-gradient(ellipse 80% 50% at 70% -10%, rgba(85,85,255,.13), transparent 70%),
+                   radial-gradient(ellipse 50% 40% at 0% 0%, rgba(255,85,255,.06), transparent 70%);
+  background-repeat:no-repeat}
+a{color:var(--cyan);text-decoration:none}
+a:hover{text-decoration:underline;text-underline-offset:3px}
+img{max-width:100%;display:block}
+.wrap{max-width:var(--max);margin:0 auto;padding:0 24px}
+::selection{background:var(--magenta);color:#000}
+
+/* EGA palette stripe */
+.palette{display:flex;height:4px}
+.palette i{flex:1}
+
+/* header */
+header.top{position:sticky;top:0;z-index:20;background:rgba(10,12,18,.82);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+header.top .wrap{display:flex;align-items:center;justify-content:space-between;height:60px}
+.logo{font-family:var(--pixel);font-size:32px;line-height:1;color:var(--white);letter-spacing:.02em;display:flex;align-items:center;gap:10px}
+.logo:hover{text-decoration:none}
+.logo img{width:24px;height:24px}
+.logo b{font-weight:400;color:var(--magenta)}
+nav.links{display:flex;gap:26px;font:500 13px/1 var(--mono);text-transform:uppercase;letter-spacing:.08em}
+nav.links a{color:var(--muted)}
+nav.links a:hover{color:var(--white);text-decoration:none}
+nav.links a.gh{color:var(--cyan)}
+@media (max-width:760px){nav.links a:not(.gh){display:none}}
+
+/* hero */
+.hero{padding:88px 0 72px}
+.hero .wrap{display:grid;grid-template-columns:1.05fr 1fr;gap:56px;align-items:center}
+@media (max-width:920px){.hero .wrap{grid-template-columns:1fr;gap:44px}.hero{padding-top:56px}}
+.kicker{font:500 13px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--green);display:flex;align-items:center;gap:10px;margin-bottom:22px}
+.kicker::before{content:"";width:8px;height:8px;background:var(--green);box-shadow:0 0 10px var(--green)}
+h1{font-family:var(--pixel);font-weight:400;font-size:clamp(52px,7.4vw,92px);line-height:.92;margin:0 0 24px;color:var(--white);letter-spacing:-.005em}
+h1 .c{color:var(--cyan)}
+.lede{font-size:19px;color:var(--text);max-width:34em;margin:0 0 32px}
+.lede strong{color:var(--white);font-weight:500}
+.cta{display:flex;flex-wrap:wrap;gap:12px}
+.btn{font:500 14px/1 var(--mono);letter-spacing:.04em;padding:14px 20px;border:1px solid var(--line2);color:var(--text);background:var(--panel);display:inline-flex;align-items:center;gap:10px;transition:border-color .15s, color .15s, transform .15s}
+.btn:hover{text-decoration:none;border-color:var(--cyan);color:var(--white)}
+.btn.primary{background:var(--cyan);color:#000;border-color:var(--cyan)}
+.btn.primary:hover{background:var(--white);border-color:var(--white);color:#000}
+.btn svg{width:16px;height:16px}
+
+/* monitor frame */
+.monitor{position:relative;background:#05060a;border:1px solid var(--line2);padding:14px;box-shadow:0 30px 80px -20px rgba(0,0,0,.8), 0 0 0 1px rgba(255,255,255,.02) inset, 0 0 60px -10px rgba(85,255,255,.12)}
+.monitor .screen{position:relative;overflow:hidden;background:#000;aspect-ratio:4/3}
+.monitor .screen img{width:100%;height:100%;object-fit:cover;image-rendering:pixelated}
+.monitor .screen::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:repeating-linear-gradient(to bottom, rgba(0,0,0,0) 0 2px, rgba(0,0,0,.18) 2px 3px);mix-blend-mode:multiply}
+.monitor .bar{display:flex;justify-content:space-between;align-items:center;font:400 11px/1 var(--mono);color:var(--dim);letter-spacing:.1em;text-transform:uppercase;padding:12px 2px 0}
+.led{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);margin-right:8px;vertical-align:middle}
+
+/* POST strip */
+.post{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--bg2)}
+.post .wrap{display:grid;grid-template-columns:repeat(5,1fr)}
+.post div.cell{padding:22px 18px;border-left:1px solid var(--line)}
+.post div.cell:last-child{border-right:1px solid var(--line)}
+.post .v{font-family:var(--pixel);font-size:38px;line-height:1;color:var(--white)}
+.post .v small{font-size:22px;color:var(--muted);margin-left:2px}
+.post .k{font:400 12px/1.4 var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-top:8px}
+@media (max-width:900px){.post .wrap{grid-template-columns:repeat(2,1fr);padding:0}.post div.cell{border-right:0!important;border-bottom:1px solid var(--line)}.post div.cell:last-child{grid-column:span 2;border-bottom:0}}
+
+/* sections */
+section{padding:104px 0}
+.sec-head{display:grid;grid-template-columns:220px 1fr;gap:32px;margin-bottom:52px}
+@media (max-width:820px){.sec-head{grid-template-columns:1fr;gap:10px}}
+.sec-label{font:500 12px/1.9 var(--mono);text-transform:uppercase;letter-spacing:.14em;color:var(--dim)}
+.sec-label span{color:var(--magenta)}
+h2{font-family:var(--pixel);font-weight:400;font-size:clamp(40px,5vw,58px);line-height:1;margin:0 0 16px;color:var(--white)}
+.sec-head p{margin:0;color:var(--muted);max-width:40em;font-size:18px}
+
+/* intro */
+.intro{display:grid;grid-template-columns:220px 1fr;gap:32px}
+@media (max-width:820px){.intro{grid-template-columns:1fr}}
+.intro .body{font-size:22px;line-height:1.55;color:var(--text);max-width:36em}
+.intro .body p{margin:0 0 20px}
+.intro .body em{font-style:normal;color:var(--yellow)}
+
+/* features */
+.features{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line);border-left:1px solid var(--line)}
+@media (max-width:960px){.features{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:620px){.features{grid-template-columns:1fr}}
+.feat{padding:28px 26px 30px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.012),transparent);transition:background .2s}
+.feat:hover{background:var(--panel)}
+.feat .tag{font:500 11px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;display:inline-block;padding:5px 7px;margin-bottom:18px;border:1px solid currentColor}
+.feat h3{font:600 18px/1.3 var(--sans);color:var(--white);margin:0 0 10px}
+.feat p{margin:0;color:var(--muted);font-size:15.5px;line-height:1.6}
+.feat code{font-family:var(--mono);font-size:.9em;color:var(--text)}
+.t-cyan{color:var(--cyan)} .t-mag{color:var(--magenta)} .t-yel{color:var(--yellow)} .t-grn{color:var(--green)} .t-blu{color:#8a8aff} .t-red{color:var(--red)}
+
+/* screenshots */
+.shots{display:grid;grid-template-columns:repeat(3,1fr);gap:22px}
+@media (max-width:900px){.shots{grid-template-columns:1fr}}
+figure{margin:0}
+.shot{display:block;cursor:zoom-in;background:#000;border:1px solid var(--line2);padding:8px;transition:border-color .15s, transform .2s}
+.shot:hover{border-color:var(--cyan);transform:translateY(-2px)}
+.shot img{width:100%;height:auto;aspect-ratio:4/3;image-rendering:pixelated}
+figcaption{font:400 13px/1.5 var(--mono);color:var(--muted);margin-top:12px}
+figcaption b{color:var(--white);font-weight:500;display:block}
+
+/* verification */
+.verify{display:grid;grid-template-columns:repeat(3,1fr);gap:22px}
+@media (max-width:900px){.verify{grid-template-columns:1fr}}
+.vcard{background:var(--panel);border:1px solid var(--line);padding:30px 28px;position:relative}
+.vcard::before{content:"";position:absolute;left:-1px;top:-1px;width:28px;height:3px;background:var(--c)}
+.vcard .big{font-family:var(--pixel);font-size:64px;line-height:.9;color:var(--c);margin-bottom:16px}
+.vcard h3{font:600 17px/1.35 var(--sans);color:var(--white);margin:0 0 8px}
+.vcard p{margin:0;color:var(--muted);font-size:15.5px}
+
+/* hardware */
+.boards{display:grid;grid-template-columns:repeat(3,1fr);gap:22px}
+@media (max-width:820px){.boards{grid-template-columns:1fr}}
+.board{display:block;border:1px solid var(--line);background:var(--bg2);padding:28px 30px 30px;color:var(--text);transition:border-color .15s, background .15s, transform .2s}
+.board:hover{text-decoration:none;border-color:var(--cyan);background:var(--panel);transform:translateY(-2px)}
+.board .idx{font:500 12px/1 var(--mono);color:var(--magenta);letter-spacing:.1em}
+.board h3{font-family:var(--pixel);font-weight:400;font-size:52px;line-height:1;color:var(--white);margin:18px 0 10px}
+.board .sub{font:400 13px/1.4 var(--mono);color:var(--cyan);letter-spacing:.06em;text-transform:uppercase}
+.toolchain{margin-top:22px;border:1px solid var(--line);padding:20px 26px;display:flex;flex-wrap:wrap;gap:12px 28px;align-items:center;font:400 14px/1.5 var(--mono);color:var(--muted)}
+.toolchain strong{color:var(--green);font-weight:500}
+
+/* prompt CTA */
+.prompt{background:#000;border:1px solid var(--line2);padding:40px 36px;font:400 16px/1.7 var(--mono);color:#c0c0c0}
+.prompt .p{color:#c0c0c0}
+.prompt .cmd{color:var(--white)}
+.prompt .cur{display:inline-block;width:.6em;height:1.05em;background:#c0c0c0;vertical-align:-2px;animation:blink 1.06s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+@media (prefers-reduced-motion:reduce){.prompt .cur{animation:none}}
+.prompt a{color:var(--cyan)}
+
+/* get started */
+.start{display:grid;grid-template-columns:1.25fr 1fr;gap:22px;align-items:start}
+@media (max-width:900px){.start{grid-template-columns:1fr}}
+.start .prompt{padding:30px 30px;font-size:15px;overflow-x:auto;white-space:nowrap}
+.prompt .rem{color:#6b7286;margin-left:10px}
+.doclinks{list-style:none;margin:0;padding:0;border-top:1px solid var(--line)}
+.doclinks a{display:block;padding:17px 4px;border-bottom:1px solid var(--line);color:var(--text)}
+.doclinks a:hover{text-decoration:none;background:var(--bg2)}
+.doclinks b{display:block;font:600 16px/1.3 var(--sans);color:var(--white)}
+.doclinks a:hover b{color:var(--cyan)}
+.doclinks span{font:400 13px/1.5 var(--mono);color:var(--muted)}
+.feat p a{white-space:nowrap}
+.vcard p a{white-space:nowrap}
+
+/* footer */
+footer{border-top:1px solid var(--line);padding:44px 0 56px;color:var(--muted);font:400 14px/1.7 var(--mono)}
+footer .wrap{display:grid;grid-template-columns:1.3fr 1fr 1fr;gap:32px}
+@media (max-width:760px){footer .wrap{grid-template-columns:1fr}}
+footer h4{font:500 12px/1 var(--mono);text-transform:uppercase;letter-spacing:.14em;color:var(--dim);margin:0 0 14px}
+footer ul{list-style:none;margin:0;padding:0}
+footer a{color:var(--text)}
+footer a:hover{color:var(--cyan)}
+footer .logo{margin-bottom:12px}
+
+/* lightbox */
+dialog.lb{padding:0;border:1px solid var(--line2);background:#000;max-width:min(96vw,1280px);width:auto}
+dialog.lb::backdrop{background:rgba(4,5,8,.9);backdrop-filter:blur(4px)}
+dialog.lb img{width:min(96vw,1280px,calc(90vh * 4 / 3));image-rendering:pixelated}
+dialog.lb p{margin:0;padding:12px 16px;font:400 13px/1.4 var(--mono);color:var(--muted);display:flex;justify-content:space-between;gap:16px}
+dialog.lb button{all:unset;cursor:pointer;color:var(--cyan)}
+</style>
+</head>
+<body>
+
+<div class="palette" aria-hidden="true"><i style="background:#000"></i><i style="background:#0000aa"></i><i style="background:#00aa00"></i><i style="background:#00aaaa"></i><i style="background:#aa0000"></i><i style="background:#aa00aa"></i><i style="background:#aa5500"></i><i style="background:#aaaaaa"></i><i style="background:#555555"></i><i style="background:#5555ff"></i><i style="background:#55ff55"></i><i style="background:#55ffff"></i><i style="background:#ff5555"></i><i style="background:#ff55ff"></i><i style="background:#ffff55"></i><i style="background:#ffffff"></i></div>
+
+<header class="top">
+  <div class="wrap">
+    <a class="logo" href="#top"><img src="favicon.svg" alt=""><span>MACH<b>86</b></span></a>
+    <nav class="links">
+      <a href="#features">Features</a>
+      <a href="#screenshots">Screenshots</a>
+      <a href="#verification">Verification</a>
+      <a href="#hardware">Hardware</a>
+      <a href="#start">Get started</a>
+      <a class="gh" href="https://github.com/machdyne/mach86">GitHub ↗</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<div class="hero">
+  <div class="wrap">
+    <div>
+      <div class="kicker">Now on GitHub · Open-source gateware</div>
+      <h1>A <span class="c">486-class PC</span> on an FPGA, written from scratch.</h1>
+      <p class="lede">Mach86 is a clean-room PC-compatible computer in plain Verilog. It <strong>boots DOS from an SD card</strong> and runs DOS software and games on small ECP5 boards, with its own CPU core, BIOS, VGA, sound and USB input.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/machdyne/mach86">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          View on GitHub
+        </a>
+        <a class="btn" href="#start">C:\&gt; GET STARTED</a>
+      </div>
+    </div>
+    <div class="monitor">
+      <div class="screen"><img src="img/boot.png" alt="Mach86 booting FreeDOS: BIOS banner, SD card partitions, HimemX and the Mach86 mouse driver loading" width="640" height="480"></div>
+      <div class="bar"><span><span class="led"></span>Mach86 BIOS · FreeDOS</span><span>640×480 · DVI</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="post">
+  <div class="wrap">
+    <div class="cell"><div class="v">33<small>MHz</small></div><div class="k">486SX-class CPU</div></div>
+    <div class="cell"><div class="v">21.4<small>MIPS</small></div><div class="k">Measured on a board</div></div>
+    <div class="cell"><div class="v">16<small>KB</small></div><div class="k">Original BIOS</div></div>
+    <div class="cell"><div class="v">1.7<small>M</small></div><div class="k">Instruction tests from a real 386</div></div>
+    <div class="cell"><div class="v">DOOM</div><div class="k">Shareware episode runs</div></div>
+  </div>
+</div>
+
+<section>
+  <div class="wrap intro">
+    <div class="sec-label"><span>00</span> / Clean room</div>
+    <div class="body">
+      <p>The CPU, its microcode and the BIOS are original work, written from scratch against <em>public documentation</em> (<a href="https://github.com/machdyne/mach86/blob/main/docs/cleanroom.md">clean-room policy</a>) and checked instruction by instruction against a reference model and against test vectors captured from real hardware.</p>
+    </div>
+  </div>
+</section>
+
+<section id="features" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-label"><span>01</span> / Features</div>
+      <div>
+        <h2>Everything a DOS game expects.</h2>
+        <p>CPU, memory, graphics, sound, input and storage, all implemented in gateware and firmware written for this project.</p>
+      </div>
+    </div>
+    <div class="features">
+      <div class="feat"><span class="tag t-cyan">CPU</span><h3>486SX-class at 33 MHz</h3><p>The 486SX instruction set, 16- and 32-bit, including <code>BSWAP</code>, <code>CMPXCHG</code> and <code>XADD</code>, at about 21 million instructions a second, measured on a board. A decoded-instruction cache and microcode make most instructions one or two clock cycles. <a href="https://github.com/machdyne/mach86/blob/main/docs/cpu_b.md">How the CPU works →</a></p></div>
+      <div class="feat"><span class="tag t-mag">Memory</span><h3>Protected mode &amp; DOS/4GW</h3><p>32-bit code and stacks, interrupts and faults through gates: enough for DOS/4GW, and DOOM's shareware episode runs. Extended memory through HimemX. <a href="https://github.com/machdyne/mach86/blob/main/docs/pmode.md">Details →</a></p></div>
+      <div class="feat"><span class="tag t-yel">Video</span><h3>VGA graphics</h3><p>Text, CGA, EGA and VGA modes, up to 640×480 in 16 colours and 320×200 in 256 colours, over DVI/HDMI.</p></div>
+      <div class="feat"><span class="tag t-grn">Audio</span><h3>PC speaker &amp; AdLib</h3><p>PC speaker and AdLib (OPL2) sound, delivered over HDMI audio, S/PDIF or a one-pin DAC.</p></div>
+      <div class="feat"><span class="tag t-blu">Input</span><h3>USB keyboard &amp; mouse</h3><p>Low-speed USB keyboards and mice that speak the HID boot protocol. Includes an <code>INT 33h</code> mouse driver.</p></div>
+      <div class="feat"><span class="tag t-red">Storage</span><h3>SD card</h3><p>The microSD card is the hard disk: a boot partition, FAT32 for your programs, and <code style="font-family:var(--mono);font-size:.9em;color:var(--text)">MOUNT file.ISO</code> to put a CD image on E:.</p></div>
+      <div class="feat"><span class="tag t-cyan">Firmware</span><h3>Its own 16 KB BIOS</h3><p>Written from scratch for Mach86. Boots FreeDOS.</p></div>
+      <div class="feat"><span class="tag t-mag">Compat</span><h3>Speed control</h3><p><code style="font-family:var(--mono);font-size:.9em;color:var(--text)">SLOW n</code> slows the CPU for programs that break on fast machines, like the Monkey Island demo's sound driver.</p></div>
+      <div class="feat"><span class="tag t-yel">Tools</span><h3>Open toolchain</h3><p>Plain Verilog that builds with Yosys and nextpnr. No vendor tools required.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="screenshots" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-label"><span>02</span> / Screenshots</div>
+      <div>
+        <h2>Running on real gateware.</h2>
+        <p>Captured from Mach86 itself, not an emulator. Click to enlarge.</p>
+      </div>
+    </div>
+    <div class="shots">
+      <figure>
+        <a class="shot" href="img/monkey-island.png" data-cap="The Secret of Monkey Island in 16-colour EGA"><img src="img/monkey-island.png" alt="The Secret of Monkey Island running in EGA mode on Mach86" width="640" height="480"></a>
+        <figcaption><b>The Secret of Monkey Island demo</b>EGA graphics and AdLib music, under SLOW 5</figcaption>
+      </figure>
+      <figure>
+        <a class="shot" href="img/boot.png" data-cap="Booting FreeDOS from the SD card"><img src="img/boot.png" alt="Mach86 BIOS booting FreeDOS from an SD card" width="640" height="480"></a>
+        <figcaption><b>Booting FreeDOS</b>Mach86 BIOS, FAT32 on SD, HimemX, mouse driver</figcaption>
+      </figure>
+      <figure>
+        <a class="shot" href="img/simtel.png" data-cap="Browsing the Simtel MS-DOS archive from a mounted CD image"><img src="img/simtel.png" alt="Simtel MS-DOS archive directory browser running on Mach86" width="640" height="480"></a>
+        <figcaption><b>Simtel MS-DOS archive</b>Browsing a CD image mounted as drive E:</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section id="verification" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-label"><span>03</span> / Verification</div>
+      <div>
+        <h2>Heavily verified.</h2>
+        <p>An x86 is only as good as its corner cases. Mach86 is tested at every level, from single instructions up to the pins.</p>
+      </div>
+    </div>
+    <div class="verify">
+      <div class="vcard" style="--c:var(--cyan)"><div class="big">1.7M</div><h3>Instruction tests from real hardware</h3><p>Test vectors captured from a real 386, run against the reference model, instruction by instruction.</p></div>
+      <div class="vcard" style="--c:var(--magenta)"><div class="big">1:1</div><h3>Lockstep against a C model</h3><p>The gateware runs alongside a reference model written in C, and the two are compared after every instruction.</p></div>
+      <div class="vcard" style="--c:var(--yellow)"><div class="big">SoC</div><h3>Full-system simulation</h3><p>The whole machine is simulated down to its pins, and booted in simulation before it goes on a board. <a href="https://github.com/machdyne/mach86/blob/main/docs/verification.md">How it is tested →</a></p></div>
+    </div>
+  </div>
+</section>
+
+<section id="hardware" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-label"><span>04</span> / Hardware</div>
+      <div>
+        <h2>Runs on Machdyne computers.</h2>
+        <p>Mach86 runs on the three primary computers from <a href="https://machdyne.com">Machdyne</a>.</p>
+      </div>
+    </div>
+    <div class="boards">
+      <a class="board" href="https://machdyne.com"><span class="idx">A:</span><h3>Konfekt</h3><span class="sub">Machdyne computer</span></a>
+      <a class="board" href="https://machdyne.com"><span class="idx">B:</span><h3>Lakritz</h3><span class="sub">Machdyne computer</span></a>
+      <a class="board" href="https://machdyne.com"><span class="idx">C:</span><h3>Mozart</h3><span class="sub">with ML0 · ML1 · ML2</span></a>
+    </div>
+    <div class="toolchain"><span><strong>$</strong> yosys</span><span><strong>$</strong> nextpnr-ecp5</span><span><strong>$</strong> ecppack</span><span style="margin-left:auto">Fully open-source build flow</span></div>
+  </div>
+</section>
+
+<section id="start" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-label"><span>05</span> / Get started</div>
+      <div>
+        <h2>Build it, flash it, boot DOS.</h2>
+        <p>The source, the BIOS, the tests and the documentation are on <a href="https://github.com/machdyne/mach86">GitHub</a>. To build you need a recent <a href="https://github.com/YosysHQ/oss-cad-suite-build">OSS CAD Suite</a>, a C compiler, NASM, Python 3 and mtools; the tests also use Verilator and Icarus Verilog.</p>
+      </div>
+    </div>
+    <div class="start">
+      <div class="prompt">
+        <div><span class="p">C:\&gt;</span><span class="cmd">git clone https://github.com/machdyne/mach86</span></div>
+        <div><span class="p">C:\&gt;</span><span class="cmd">make lakritz</span> <span class="rem">rem the bitstream</span></div>
+        <div><span class="p">C:\&gt;</span><span class="cmd">tools/fetch_dos.sh</span> <span class="rem">rem FreeDOS + HimemX</span></div>
+        <div><span class="p">C:\&gt;</span><span class="cmd">make card</span> <span class="rem">rem the boot disk</span></div>
+        <div><span class="p">C:\&gt;</span><span class="cmd">make check</span> <span class="rem">rem run the test suite</span></div>
+        <div><span class="p">C:\&gt;</span><span class="cur"></span></div>
+      </div>
+      <ul class="doclinks">
+        <li><a href="https://github.com/machdyne/mach86/blob/main/docs/running.md"><b>Running on a board</b><span>Build, write the card, and what should happen</span></a></li>
+        <li><a href="https://github.com/machdyne/mach86#status"><b>Status</b><span>What runs on hardware, what is simulated, what is missing</span></a></li>
+        <li><a href="https://github.com/machdyne/mach86/blob/main/docs/cpu_b.md"><b>The CPU</b><span>Decode once into block RAM, execute from there</span></a></li>
+        <li><a href="https://github.com/machdyne/mach86/blob/main/docs/README.md"><b>All documentation</b><span>BIOS, video, sound, protected mode, verification</span></a></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a class="logo" href="#top"><img src="favicon.svg" alt=""><span>MACH<b>86</b></span></a>
+      <div>A PC-compatible SoC for FPGAs.<br>Released under the Lone Dynamics Open License.</div>
+    </div>
+    <div>
+      <h4>Project</h4>
+      <ul>
+        <li><a href="https://github.com/machdyne/mach86">Source on GitHub</a></li>
+        <li><a href="https://github.com/machdyne/mach86/blob/main/docs/README.md">Documentation</a></li>
+        <li><a href="https://github.com/machdyne/mach86/issues">Issues</a></li>
+        <li><a href="https://github.com/machdyne/mach86/blob/main/LICENSE.md">License</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Elsewhere</h4>
+      <ul>
+        <li><a href="https://machdyne.com">Machdyne</a></li>
+        <li><a href="https://zeitlos.org">Zeitlos</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<dialog class="lb" id="lb">
+  <img src="" alt="">
+  <p><span id="lbcap"></span><button type="button" onclick="this.closest('dialog').close()">[ESC] Close</button></p>
+</dialog>
+
+<script>
+(function(){
+  var lb=document.getElementById('lb'); if(!lb.showModal) return;
+  var img=lb.querySelector('img'), cap=document.getElementById('lbcap');
+  document.querySelectorAll('a.shot').forEach(function(a){
+    a.addEventListener('click',function(e){
+      e.preventDefault(); img.src=a.getAttribute('href'); img.alt=a.querySelector('img').alt;
+      cap.textContent=a.dataset.cap||''; lb.showModal();
+    });
+  });
+  lb.addEventListener('click',function(e){ if(e.target===lb) lb.close(); });
+})();
+</script>
+</body>
+</html>

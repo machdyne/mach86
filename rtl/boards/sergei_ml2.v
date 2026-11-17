@@ -32,8 +32,17 @@
  * boards/sergei_ml2.lpf). It is an input with a pull-up here: an
  * unused pin would be pulled down, and that would reconfigure the
  * FPGA for ever.
+ *
+ * Mozart ML2 is the same module in another carrier and is built from
+ * this file with defines (the Makefile's): M86_TOP names the module;
+ * M86_PT8211 sends the sound to a PT8211 DAC and not to the optical
+ * output; M86_NO_SDDAT leaves out the card's two unused data lines.
+ * It has not run on a board.
  */
-module sergei_ml2 (
+`ifndef M86_TOP
+`define M86_TOP sergei_ml2
+`endif
+module `M86_TOP (
     input  wire CLK_48,
     output wire LED_B,
     output wire UART0_TX,
@@ -42,13 +51,21 @@ module sergei_ml2 (
     output wire SD_MOSI,
     input  wire SD_MISO,
     output wire SD_SS,
+`ifndef M86_NO_SDDAT
     input  wire SD_D1,
     input  wire SD_D2,
+`endif
     output wire DDMI_CK_P,          // one port a pair: the tool drives the N ball
     output wire DDMI_D0_P,
     output wire DDMI_D1_P,
     output wire DDMI_D2_P,
+`ifdef M86_PT8211
+    output wire AUD_BCK,
+    output wire AUD_WS,
+    output wire AUD_DIN,
+`else
     output wire AUD_OPTICAL,        // S/PDIF, optical
+`endif
     input  wire PROGRAMN,
     inout  wire usb_host_dp,        // the first USB host port
     inout  wire usb_host_dm,
@@ -207,11 +224,16 @@ module sergei_ml2 (
         .aclk(CLK_48), .arst(!apor[7]),
         .tick(a_tick), .frame_req(a_frame), .sample(a_sample),
         .sd_l(), .sd_r());
+`ifdef M86_PT8211
+    m86_pt8211 dac (.aclk(CLK_48), .arst(!apor[7]), .sample(a_sample),
+                    .bck(AUD_BCK), .ws(AUD_WS), .din(AUD_DIN));
+`else
     audio_spdif spdif (
         .clk(CLK_48), .rst(!apor[7]), .enable(1'b1),
         .tick(a_tick), .frame_req(a_frame),
         .sample_l(a_sample), .sample_r(a_sample),
         .fs_code(4'd2), .spdif(AUD_OPTICAL));
+`endif
 
     // The memory and the controller's registers, across the clocks.
     wire        wb_stb, wb_we, wb_ack, rg_stb, rg_we, rg_ack;

@@ -22,22 +22,45 @@
  * (sim/m86_lakritz_tb.v). docs/boards.md says what is known and not.
  *
  * LED_B: slow blink, the machine runs; fast, the CPU has faulted.
+ *
+ * The other SDRAM boards are built from this file too, with defines
+ * (the Makefile's): M86_TOP names the module; M86_UART gives the
+ * BIOS's console a serial port; M86_PT8211 sends the sound to a
+ * PT8211 DAC and not to the sigma-delta pins; M86_NO_SDDAT leaves
+ * out the card's two unused data lines, where the board's constraint
+ * file does not name them. Konfekt is M86_NO_SDDAT; Mozart ML0 and
+ * ML1 are all three. None of those has run on a board.
  */
-module lakritz (
+`ifndef M86_TOP
+`define M86_TOP lakritz
+`endif
+module `M86_TOP (
     input  wire CLK_48,
     output wire LED_B,
     output wire SD_SCK,
     output wire SD_MOSI,
     input  wire SD_MISO,
     output wire SD_SS,
+`ifndef M86_NO_SDDAT
     input  wire SD_DAT1,
     input  wire SD_DAT2,
+`endif
+`ifdef M86_UART
+    output wire UART0_TX,
+    input  wire UART0_RX,
+`endif
     output wire DDMI_CK_P,
     output wire DDMI_D0_P,
     output wire DDMI_D1_P,
     output wire DDMI_D2_P,
+`ifdef M86_PT8211
+    output wire AUD_BCK,
+    output wire AUD_WS,
+    output wire AUD_DIN,
+`else
     output wire AUDIO_L,
     output wire AUDIO_R,
+`endif
     input  wire PROGRAMN,
     inout  wire [1:0] usb_host_dp,
     inout  wire [1:0] usb_host_dm,
@@ -135,7 +158,11 @@ module lakritz (
         .clk(clk), .rst(rst), .vclk(pclk),
         .v_r(v_r), .v_g(v_g), .v_b(v_b),
         .v_hsync(v_hs), .v_vsync(v_vs), .v_de(v_de),
+`ifdef M86_UART
+        .uart_tx(UART0_TX), .uart_rx(UART0_RX),
+`else
         .uart_tx(), .uart_rx(1'b1),
+`endif
         .sd_sck(SD_SCK), .sd_mosi(SD_MOSI), .sd_miso(SD_MISO), .sd_ss_n(SD_SS),
         .m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_wdata(m_wdata),
         .m_rdata(mem_q), .m_ack(m_ack),
@@ -197,8 +224,13 @@ module lakritz (
         .clk(clk), .opl_we(opl_we), .opl_a(opl_a), .opl_d(opl_d), .spk(spk),
         .aclk(CLK_48), .arst(!apor[7]),
         .tick(), .frame_req(a_frame), .sample(a_sample), .sd_l(a_sd), .sd_r());
+`ifdef M86_PT8211
+    m86_pt8211 dac (.aclk(CLK_48), .arst(!apor[7]), .sample(a_sample),
+                    .bck(AUD_BCK), .ws(AUD_WS), .din(AUD_DIN));
+`else
     assign AUDIO_L = a_sd;
     assign AUDIO_R = a_sd;
+`endif
 
     // The display.
     wire [1:0] t_r, t_g, t_b, t_c;

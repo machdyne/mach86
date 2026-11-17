@@ -41,6 +41,8 @@ help:
 	@echo "  make gate-dos     DOS on the SoC after synthesis (slow)"
 	@echo "  make lakritz      a bitstream for Lakritz (not run on a board)"
 	@echo "  make sergei_ml2   a bitstream for Sergei ML2 (docs/running.md)"
+	@echo "  make lakritz      ... for Lakritz"
+	@echo "  make konfekt, mozart_ml0, mozart_ml1, mozart_ml2   ... for those (never built: docs/boards.md)"
 	@echo "  make sdcard       a DOS disk image to write to its microSD card"
 	@echo "  make synth-b      synthesise, place and route CPU design B"
 	@echo "                    for Lakritz's FPGA; report size and clock"
@@ -263,6 +265,41 @@ sergei_ml2:
 	@grep -E "Max frequency" $(BOARD_OUT)/pnr.log | tail -n 2
 	cd $(BOARD_OUT) && ecppack --compress --freq 2.4 mach86.config --bit mach86.bit
 	@ls -l $(BOARD_OUT)/mach86.bit
+
+# The other boards. Each is one of the two builds above with another
+# constraint file and a few defines (rtl/boards/lakritz.v and
+# sergei_ml2.v say which). NONE OF THESE HAS BEEN BUILT OR RUN
+# (docs/boards.md): the rules are here so that they can be.
+#
+#   $(call OTHER_BOARD,name,sdram|ddr3,nextpnr device,constraints,defines)
+define OTHER_BOARD
+.PHONY: $(1)
+$(1):
+	@mkdir -p output/$(1)
+	$$(MAKE) -C sim ../output/bios/bios.bin
+	python3 sw/ucode/m86b_ucode.py output/$(1) > /dev/null
+	python3 tools/lanes.py output/bios/bios.bin output/$(1)/rom 0x4000 16
+	python3 tools/mkfont.py sw/font/font16.mem output/$(1)/font.hex
+	python3 tools/mkopl.py output/$(1)/opl_rom.hex
+	cp rtl/ext/usb_hid_host/usb_hid_host_rom.hex output/$(1)/
+	cd output/$(1) && yosys -q -l syn.log -p "read_verilog -DM86_TOP=$(1) $(5) \
+	  $(if $(filter ddr3,$(2)),-DOSC48 $$(addprefix ../../,$$(RTL_BOARD)) ../../rtl/boards/sergei_ml2.v; \
+	    hierarchy -top $(1); write_rtlil elab.il; design -reset; read_rtlil elab.il,\
+	    $$(addprefix ../../,$$(RTL_LAK)) ../../rtl/boards/lakritz.v); \
+	  synth_ecp5 -top $(1) -abc9 -nowidelut -json mach86.json; stat"
+	@grep -E "LUT4|TRELLIS_FF|DP16KD|MULT18X18D|TRELLIS_DPR16X4" output/$(1)/syn.log | tail -n 5
+	cd output/$(1) && nextpnr-ecp5 $(3) --package CABGA256 --speed 6 \
+	  --lpf ../../boards/$(4) --json mach86.json \
+	  --textcfg mach86.config --seed $$(SEED) > pnr.log 2>&1
+	@grep -E "TRELLIS_COMB|DP16KD:" output/$(1)/pnr.log | tail -n 2
+	@grep -E "Max frequency" output/$(1)/pnr.log | tail -n 2
+	cd output/$(1) && ecppack --compress --freq 2.4 mach86.config --bit mach86.bit
+	@ls -l output/$(1)/mach86.bit
+endef
+$(eval $(call OTHER_BOARD,konfekt,sdram,--12k,konfekt.lpf,-DM86_NO_SDDAT))
+$(eval $(call OTHER_BOARD,mozart_ml0,sdram,--25k,mozart_ml1.lpf,-DM86_NO_SDDAT -DM86_UART -DM86_PT8211))
+$(eval $(call OTHER_BOARD,mozart_ml1,sdram,--45k,mozart_ml1.lpf,-DM86_NO_SDDAT -DM86_UART -DM86_PT8211))
+$(eval $(call OTHER_BOARD,mozart_ml2,ddr3,--45k,mozart_ml2.lpf,-DM86_NO_SDDAT -DM86_PT8211))
 
 # Design B: size, and routed clock on an LFE5U-25F. nextpnr exits with
 # an error when the clock target is missed; the figures are printed
