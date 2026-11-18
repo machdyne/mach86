@@ -657,6 +657,9 @@ static uint8_t port_read8(pc *p, uint16_t port)
     case 0x22A: case 0x22C: case 0x22E:
         return sb_read(p, port);
     case 0x228: case 0x388:
+        /* (A read takes a microsecond and a half, as through an ISA
+         * bus: programs wait for the chip's timers by reading it.) */
+        pc_devices(p, 29);
         return (uint8_t)(((p->opl.f1 || p->opl.f2) << 7) | (p->opl.f1 << 6) |
                          (p->opl.f2 << 5) | 0x06);
     case 0xE3: return mouse_read(p);

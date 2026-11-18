@@ -185,9 +185,29 @@ module m86_soc #(
         .slow(slow), .irq(irq), .irq_vec(irq_vec), .inta(inta),
         .halted(halted), .step_done(), .last_exc(last_exc), .dbg_insns());
 
-    always @(posedge clk)
+    // A read of the AdLib's status takes a microsecond and a half, as
+    // it does through an ISA bus. Programs count on it: the usual way
+    // to find the chip starts its 80-microsecond timer and then reads
+    // the status a hundred times "to wait long enough" (Duke Nukem
+    // 3D's sound library does; on a bus as fast as ours it found no
+    // chip).
+    localparam integer ISA_CYCLES = CLK_HZ / 666667;
+    reg [6:0]   isa_cnt;
+    reg         isa_wait;
+    wire        isa_slow = d_req && d_io && !d_wr && cs_opl;
+    always @(posedge clk) begin
         ack_r <= d_req && !d_wr && !ack_r && !sys_rst && !(MAIN_MEM != 0 && is_main) &&
-                 !is_vid && !(d_io && cs_vga && !v_idle);
+                 !is_vid && !(d_io && cs_vga && !v_idle) &&
+                 (!isa_slow || (isa_wait && isa_cnt == 7'd0));
+        if (isa_slow && !isa_wait && !ack_r) begin
+            isa_wait <= 1'b1;
+            isa_cnt  <= ISA_CYCLES[6:0];
+        end else if (isa_wait) begin
+            if (isa_cnt == 7'd0) isa_wait <= 1'b0;
+            else                 isa_cnt <= isa_cnt - 7'd1;
+        end
+        if (sys_rst) isa_wait <= 1'b0;
+    end
 
     // ---- memory ----
     wire        a20;
@@ -283,7 +303,7 @@ module m86_soc #(
 
     // ---- ports ----
     wire [15:0] port  = d_addr[15:0];
-    wire        io_rd = d_req && d_io && !d_wr && !ack_r;   // once per read
+    wire        io_rd = d_req && d_io && !d_wr && !ack_r && !isa_wait;   // once per read
     wire        io_wr = d_req && d_io && d_wr;
     wire [7:0]  io_wd = d_wdata[7:0];
 

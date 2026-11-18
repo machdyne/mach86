@@ -16,7 +16,7 @@ Sergei ML2; **the Lakritz build has not run on a board yet.**
 | Display | DVI on the HDMI connector, 640 x 480 at 60 Hz ([video.md](video.md)); HDMI with sound after `HDMI ON` ([sound.md](sound.md)) | The same |
 | Keyboard | A low-speed USB keyboard, as a PC keyboard (US layout); also the serial console | USB keyboard; no serial console |
 | Mouse | A USB mouse on the other USB port ([mouse.md](mouse.md)) | The same |
-| Console | The board's UART, 115200 baud, 8N1 | None |
+| Console | The board's UART, 1,000,000 baud, 8N1 (as Zeitlos; 33 CPU clocks a bit, half a percent fast) | None |
 | Disk | The microSD card, in SPI mode ([card.md](card.md)) | The same |
 | Sound | PC speaker and AdLib: on the optical output, and on HDMI after `HDMI ON` | On the audio pins (sigma-delta), and on HDMI |
 | Not used | Ethernet, the configuration flash | The configuration flash |
@@ -38,7 +38,7 @@ keyboards with a built-in hub, are not and will not be seen.
 - A display with an HDMI or DVI input.
 - A microSD card of the SDHC or SDXC kind, 4 GB or more.
   **Everything on the card is overwritten.**
-- On Sergei ML2, optionally a serial terminal at 115200 baud.
+- On Sergei ML2, optionally a serial terminal at 1,000,000 baud.
 - To build: a C compiler, NASM, Python 3, mtools, and a recent
   [OSS CAD Suite](https://github.com/YosysHQ/oss-cad-suite-build)
   (Yosys, nextpnr-ecp5, ecppack) on the path. The Ubuntu packages of

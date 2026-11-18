@@ -153,6 +153,34 @@ start:  mov     dx, m_hello
         mov     al, 0D3h
         call    dsp_put
 
+        ; The AdLib at the Sound Blaster's ports, found the way Apogee's
+        ; sound library looks for it: timer 1 is started and the status
+        ; read a hundred times "to wait"; the timer must have run out.
+        mov     ax, 6004h
+        call    opl
+        mov     ax, 8004h
+        call    opl
+        mov     dx, BASE + 8
+        in      al, dx
+        test    al, 0E0h
+        jnz     fail_r
+        mov     ax, 0FF02h
+        call    opl
+        mov     ax, 2104h
+        call    opl
+        mov     dx, BASE + 8
+        mov     cx, 100
+.wt:    in      al, dx
+        loop    .wt
+        in      al, dx
+        and     al, 0E0h
+        cmp     al, 0C0h
+        jne     fail_r
+        mov     ax, 6004h
+        call    opl
+        mov     ax, 8004h
+        call    opl
+
         call    restore
         mov     dx, m_ok
         call    print
@@ -231,6 +259,14 @@ isr:    push    ax
         pop     dx
         pop     ax
         iret
+
+; AdLib register AL = AH, through 228h and 229h.
+opl:    mov     dx, BASE + 8
+        out     dx, al
+        inc     dx
+        mov     al, ah
+        out     dx, al
+        ret
 
 dsp_put:
         push    ax

@@ -106,7 +106,7 @@ yet; when it is, this table is replaced by its measurements.
 |---|---:|---:|
 | Logic cells | **22,500** (round 30; 19,900 before paging and virtual 8086 mode; the Sound Blaster took 130) | 24,288 (**92%**) |
 | Block RAM | **56: all of them** (round 26) | 56 |
-| CPU clock | routed at 35.8 MHz (round 30, one seed, with the placer's timing weight raised as on the Sergei) | runs at 33.16 |
+| CPU clock | routed at 36.9 MHz (round 31, one seed, with the placer's timing weight raised as on the Sergei) | runs at 33.16 |
 
 Round 29 took 2,500 logic cells for paging, virtual 8086 mode and
 the I/O permission bitmap, and Lakritz is now nearly full: about

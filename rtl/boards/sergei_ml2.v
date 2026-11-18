@@ -184,7 +184,7 @@ module `M86_TOP (
     wire [23:0] m_addr;
     wire [1:0]  x_addr;
     wire [31:0] m_wdata, m_rdata, x_wdata, x_rdata;
-    m86_soc #(.CLK_HZ(33157895), .BAUD(115200),
+    m86_soc #(.CLK_HZ(33157895), .BAUD(1000000),
               .MAIN_MEM(1), .MEM_AW(26), .MEM_TRAIN(1),
               .CACHE_LINE_BITS(11), .EXT_KB(64512), .VGA_EXT(1)) soc (
         .clk(clk), .rst(rst),

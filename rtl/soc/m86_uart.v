@@ -20,7 +20,7 @@ module m86_uart #(
     output reg        txd = 1'b1,  // the line idles high from power-on
     input  wire       rxd
 );
-    localparam integer DIV = CLK_HZ / BAUD;
+    localparam integer DIV = (CLK_HZ + BAUD / 2) / BAUD;    // to the nearest cycle
 
     // ---- transmit ----
     reg [7:0]  fifo [0:15];

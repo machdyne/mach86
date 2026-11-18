@@ -151,7 +151,7 @@ module `M86_TOP (
     wire [7:0]  lb_addr;
     wire        spk, opl_we;
     wire [7:0]  opl_a, opl_d, sb_sample;
-    m86_soc #(.CLK_HZ(33157895), .BAUD(115200),
+    m86_soc #(.CLK_HZ(33157895), .BAUD(1000000),
               .MAIN_MEM(1), .MEM_AW(25), .MEM_TRAIN(0),
               .CACHE_LINE_BITS(10), .EXT_KB(31488),
               .VGA_EXT(1), .VGA_BRAM(0)) soc (

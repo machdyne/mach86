@@ -2529,6 +2529,47 @@ void m86_step(m86 *c)
             }
         }
     }
+    /* M86_DC=1: how a decoded-instruction cache of a few shapes would
+     * do on this program (misses per 100 million instructions). */
+    {
+        static int on = -1;
+        static uint32_t *t[4];
+        static uint8_t *lru;
+        static uint64_t n, miss[4];
+        if (on < 0) {
+            on = getenv("M86_DC") != NULL;
+            if (on) {
+                for (int i = 0; i < 4; i++)
+                    t[i] = calloc(16384, sizeof(uint32_t));
+                lru = calloc(2048, 1);
+            }
+        }
+        if (on) {
+            uint32_t lin = c->s.seg[M86_CS].base + c->s.eip + 1;
+            static const uint32_t size[3] = { 2048, 4096, 8192 };
+            for (int i = 0; i < 3; i++)
+                if (t[i][lin & (size[i] - 1)] != lin) {
+                    t[i][lin & (size[i] - 1)] = lin;
+                    miss[i]++;
+                }
+            /* two ways of 1,024 */
+            uint32_t k = lin & 1023;
+            if (t[3][k] == lin)
+                lru[k] = 1;
+            else if (t[3][k + 1024] == lin)
+                lru[k] = 0;
+            else {
+                t[3][k + (lru[k] ? 1024 : 0)] = lin;
+                lru[k] ^= 1;
+                miss[3]++;
+            }
+            if (++n % 100000000 == 0) {
+                fprintf(stderr, "dc: %llu M instructions; misses per cent: 2048: %.2f  4096: %.2f  8192: %.2f  2x1024: %.2f\n",
+                        (unsigned long long)(n / 1000000), miss[0] / 1e6, miss[1] / 1e6, miss[2] / 1e6, miss[3] / 1e6);
+                miss[0] = miss[1] = miss[2] = miss[3] = 0;
+            }
+        }
+    }
     int trap = (FLAGS & M86_TF) != 0;
     int f = setjmp(c->fault_jmp);
     if (f) {

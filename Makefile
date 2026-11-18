@@ -215,7 +215,7 @@ RTL_BOARD = rtl/cpu/m86_alu.v rtl/cpu/m86b_core.v $(wildcard rtl/soc/*.v) \
 # run), so the rule below tries twice.
 # The placement seed: of four tried in round 19 (31.2 to 32.9 MHz for
 # 31.5; one fails) this was the best.
-BOARD_SEED ?= 1
+BOARD_SEED ?= 2
 # The placer is told to weigh timing three times as heavily as it does by
 # itself: on the Sergei that is worth about 1 MHz of the CPU clock.
 PNR_OPT ?= --placer-heap-timingweight 30

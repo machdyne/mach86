@@ -1,4 +1,4 @@
-Copyright (c) 2026 Lone Dynamics Corporation. All rights reserved.
+Copyright (c) 2025 Lone Dynamics Corporation. All rights reserved.
 
 Redistribution and use in source, binary or physical forms, with or without
 modification, is permitted provided that the following condition is met:

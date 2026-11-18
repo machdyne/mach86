@@ -185,7 +185,7 @@ goes, and nothing else of one:
 | DSP | Version 2.01. Reset (226h), commands and data (22Ch), answers (22Ah), status and interrupt acknowledge (22Eh) |
 | Playing | 8-bit unsigned mono through DMA: one block (`14h`) or blocks without end (`48h` and `1Ch`, the "auto-initialise" mode), at the rate the time constant gives (`40h`): a sample every 256 minus the constant microseconds, 4 kHz to about 45 kHz. Pause, continue, stop at the block's end (`D0h`, `D4h`, `DAh`); the interrupt at each block's end |
 | Also | A sample written directly (`10h`); speaker on and off (`D1h`, `D3h`; off is silence); version (`E1h`); the identification and test bytes (`E0h`, `E4h`, `E8h`); an interrupt on request (`F2h`), which is how programs find the interrupt line |
-| The AdLib | Answers at 228h and 229h as well as 388h and 389h |
+| The AdLib | Answers at 228h and 229h as well as 388h and 389h. A read of its status takes 1.5 microseconds, as through an ISA bus (round 31): Apogee's sound library, in Duke Nukem 3D and others, looks for the chip by starting its 80-microsecond timer and reading the status a hundred times "to wait", and on a bus as fast as ours found none. `SBTEST` does the same |
 | Not there | Recording; the compressed formats (they are played as if they were plain samples: noise); the high-speed commands are taken as the ordinary ones; no mixer chip, so no volume |
 
 **The DMA controller** is one channel of an 8237, channel 1, and
