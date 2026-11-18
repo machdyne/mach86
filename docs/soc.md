@@ -226,10 +226,10 @@ this same board, not from anything here.
 
 | | |
 |---|---:|
-| Logic cells | 19,800 of 43,848 (45%) |
+| Logic cells | 25,600 of 43,848 (58%; round 30. Paging took about 1,600 in round 29, virtual 8086 mode and the I/O bitmap 600, the Sound Blaster 130) |
 | Block RAM | 97 of 108: CPU 30, cache 19, ROM 8, video memory 32, line buffer 1, character ROM 2, colours 1, USB hosts 2, AdLib 2 |
-| Multiplier blocks | 4 |
-| Routed clock | 34.75 MHz for the 33.16 it runs at (one placement seed; others gave 33.3 to 35.1). The 48 MHz clocks of the sound and the memory route at 53 and 71 |
+| Multiplier blocks | 9 |
+| Routed clock | 34.6 MHz for the 33.16 it runs at (round 30), with the placer told to weigh timing three times as heavily as it does by itself (`PNR_OPT` in the Makefile). Without that the same design gives 33.45 at best and 32.2 on another seed; with it two seeds gave 34.6 and 33.9. The 48 MHz clocks of the sound and the memory route at 56 and 75 |
 
 That is with the DDR3 memory and the USB keyboard. Zeitlos's
 controller and PHY are about 3,000 cells; the USB host and the

@@ -67,6 +67,18 @@ static void cycle(void)
             slow = getenv("M86B_SLOW") ? atoi(getenv("M86B_SLOW")) : 0;
 #ifdef CORE_B
         top->slow = slow;
+        /* M86B_DMA=n: ask the core for a byte of memory every n cycles,
+         * as the Sound Blaster does. Nothing may change but the time. */
+        static int dma = -1, dma_n = 0;
+        if (dma < 0)
+            dma = getenv("M86B_DMA") ? atoi(getenv("M86B_DMA")) : 0;
+        if (top->dma_ack)
+            top->dma_req = 0;
+        else if (dma && ++dma_n >= dma) {
+            dma_n = 0;
+            top->dma_req = 1;
+            top->dma_addr = 0x5000 + (rand() & 0xFFF);
+        }
 #else
         (void)slow;         /* the first core has no speed control */
 #endif
@@ -103,7 +115,11 @@ static void cycle(void)
         }
         waited = 0;
     }
-    if (top->d_req && top->d_io) {
+    if (top->d_req && top->d_io && (uint16_t)top->d_addr == 0x1E8) {
+        /* The paging unit's own port: what it read a byte at a time. */
+        if (!top->d_wr)
+            top->d_rdata = top->x_rd;
+    } else if (top->d_req && top->d_io) {
         if (top->d_wr)
             B.cpu.io_write(&B, (uint16_t)top->d_addr, 1 << top->d_size, top->d_wdata);
         else
@@ -292,6 +308,8 @@ static void compare(const pc *a)
     }
     if (c->cr0 != R(cr0))
         mismatch(a, "CR0", c->cr0, R(cr0));
+    if (c->s.cpl != R(cpl))
+        mismatch(a, "the privilege level", c->s.cpl, R(cpl));
     if (c->gdtr.base != R(gdt_base) || c->gdtr.limit != R(gdt_lim))
         mismatch(a, "GDTR", c->gdtr.base, R(gdt_base));
     if (c->idtr.base != R(idt_base) || c->idtr.limit != R(idt_lim))
@@ -417,6 +435,21 @@ void lockstep_run(pc *a, uint64_t n)
                 }
             } while (!top->step_done);
 #ifdef CORE_B
+            /* An instruction that ends with a store is done a cycle
+             * before the store is known to be allowed. If it is not,
+             * the fault is being raised now, and its delivery is the
+             * step. */
+            top->eval();
+            if (R(flt_now)) {
+                do {
+                    cycle();
+                    if (++guard > 5000000 || STOPPED()) {
+                        fprintf(stderr, "lockstep: the RTL core stopped or hung "
+                                        "at step %llu\n", steps_run);
+                        exit(1);
+                    }
+                } while (!top->step_done);
+            }
             /* An instruction that ends with a store has asked for it
              * but the bus cycle is the next one. Do the memory write
              * now so that memory can be compared; doing it again in

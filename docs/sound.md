@@ -173,14 +173,66 @@ Cost: about 600 LUTs.
   but its pitch, the manual and listening to `output/opl/*.wav`),
   and register writes crossing from the CPU's clock on the board.
 
+## The Sound Blaster
+
+Round 30 (`rtl/soc/m86_sb.v`). Digitised sound: what games use for
+effects and speech. It is a Sound Blaster 2.0 as far as playing
+goes, and nothing else of one:
+
+| | |
+|---|---|
+| Where | Ports 220h to 22Fh, interrupt 7, DMA channel 1. The boot disk sets `BLASTER=A220 I7 D1 T3`. None of it can be changed |
+| DSP | Version 2.01. Reset (226h), commands and data (22Ch), answers (22Ah), status and interrupt acknowledge (22Eh) |
+| Playing | 8-bit unsigned mono through DMA: one block (`14h`) or blocks without end (`48h` and `1Ch`, the "auto-initialise" mode), at the rate the time constant gives (`40h`): a sample every 256 minus the constant microseconds, 4 kHz to about 45 kHz. Pause, continue, stop at the block's end (`D0h`, `D4h`, `DAh`); the interrupt at each block's end |
+| Also | A sample written directly (`10h`); speaker on and off (`D1h`, `D3h`; off is silence); version (`E1h`); the identification and test bytes (`E0h`, `E4h`, `E8h`); an interrupt on request (`F2h`), which is how programs find the interrupt line |
+| The AdLib | Answers at 228h and 229h as well as 388h and 389h |
+| Not there | Recording; the compressed formats (they are played as if they were plain samples: noise); the high-speed commands are taken as the ordinary ones; no mixer chip, so no volume |
+
+**The DMA controller** is one channel of an 8237, channel 1, and
+only what playing needs: address, count, page register (83h),
+mask, the mode's auto-restart bit, the byte flip-flop, the
+terminal-count flag. Address and count can be read back while a
+block plays, which some programs do to find out how far it has got.
+The other channels' ports do nothing.
+
+**How a sample gets from memory to the DSP.** Not by a second
+master on the memory bus. The CPU core has a request line: when it
+is up the core reads one byte, at the address given, between two
+instructions, and hands it over (`dma_req`, `dma_addr`, `dma_q`,
+`dma_ack` on `m86b_core`). That costs the program about four cycles
+a sample, tens of thousands of times a second at most, which is
+nothing; it puts no multiplexer in front of the data cache, where
+the longest path of the design ends; and the byte comes through
+the cache, which is the only place a sample the program has just
+written may be. The DSP fetches one byte ahead, so a long string
+instruction, which the fetch has to wait behind, delays a sample
+only if it lasts longer than a sample period.
+
+**The mix.** The sample is centred, given half of full scale, and
+added to the speaker and the AdLib with saturation
+(`rtl/soc/m86_audio.v`). It crosses to the sound clock as a byte
+that is taken when two looks in a row agree.
+
+**Tests.** `SBTEST` on the boot disk resets the DSP, reads its
+version, finds the interrupt with `F2h`, plays a block of a
+triangle wave and then three blocks with automatic restart, and
+checks the DMA controller's flag and counters on the way; it runs
+on the model and on the simulated SoC in `make check-card`. On the
+model DOOM plays its effects through it and its music through the
+AdLib (`M86_WAV=file` writes what the Sound Blaster played). The
+core's fetch is tested in lockstep with requests at random
+addresses every few dozen cycles (`M86B_DMA=n`), through a DOS
+boot, the protected-mode and paging tests and the 386 test suite:
+nothing but the time changes. **Nobody has heard it yet.**
+
 ## Size
 
-Speaker and transmitter 450 cells; the AdLib about 1,300 cells, two block RAMs and five multipliers.
+Speaker and transmitter 450 cells; the AdLib about 1,300 cells, two block RAMs and five multipliers; the Sound Blaster with its DMA channel about 130 (Lakritz went from 22,368 logic cells to 22,497).
 
 ## What is not there
 
-- **Sound Blaster** (digitised sound: speech, effects). It needs
-  the DMA controller, which is not built either.
+- Sound Blaster recording, compressed samples, stereo, 16 bits, and
+  a mixer (above).
 - The AdLib's rhythm mode (above).
 - A volume control. The level is fixed.
 - Sound on a Lakritz pin: the signal is there, the board file is not.

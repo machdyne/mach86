@@ -104,9 +104,14 @@ yet; when it is, this table is replaced by its measurements.
 
 | | Lakritz build | Has |
 |---|---:|---:|
-| Logic cells | 17,300 (round 26) | 24,288 (71%) |
+| Logic cells | **22,500** (round 30; 19,900 before paging and virtual 8086 mode; the Sound Blaster took 130) | 24,288 (**92%**) |
 | Block RAM | **56: all of them** (round 26) | 56 |
-| CPU clock | routed at 36.2 MHz (round 26, one seed) | runs at 33.16 |
+| CPU clock | routed at 35.8 MHz (round 30, one seed, with the placer's timing weight raised as on the Sergei) | runs at 33.16 |
+
+Round 29 took 2,500 logic cells for paging, virtual 8086 mode and
+the I/O permission bitmap, and Lakritz is now nearly full: about
+1,800 cells are left after the Sound Blaster (round 30). Task
+switches, if they come, have to fit in that or take it from something.
 
 What is different from Sergei, underneath; a program sees the same
 machine:
@@ -215,7 +220,7 @@ agrees with it on every other pin used.
 
 What to expect, and what is not known:
 
-- **Konfekt may not fit.** The Lakritz build is 17,300 logic cells
+- **Konfekt may not fit.** The Lakritz build is 20,100 logic cells
   and all 56 block RAMs of a 25F. A 12F is the same package with
   half the logic and, by its data sheet, fewer block RAMs; whether
   the tools accept this design for it has not been tried. If they

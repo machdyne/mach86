@@ -21,15 +21,18 @@ and shares its licence; a few vendored files have their own
   million instructions a second at 33 MHz (measured on a board). A decoded-instruction
   cache and microcode make most instructions one or two clock cycles
   ([docs/cpu_b.md](docs/cpu_b.md)). No FPU.
-- **Protected mode:** segments, 32-bit code and stacks, interrupts
-  and faults through gates, at one privilege level: enough for
-  DOS/4GW
-  ([docs/pmode.md](docs/pmode.md)). Extended memory through an XMS
+- **Protected mode:** a 386's, but for task switches: 32-bit
+  segments, gates, the four privilege levels with their checks and
+  stack switches, paging, and virtual 8086 mode with the I/O
+  permission bitmap ([docs/pmode.md](docs/pmode.md)). DOS/4GW runs
+  on a board; the rest has passed a 386 test suite and run a memory
+  manager in simulation, and is waiting for its turn on a board. Extended memory through an XMS
   driver.
 - **Graphics:** a VGA with text, CGA, EGA and VGA modes up to
   640 x 480 in 16 colours and 320 x 200 in 256, on DVI/HDMI
   ([docs/video.md](docs/video.md)).
-- **Sound:** PC speaker and AdLib (OPL2), over HDMI, S/PDIF or a
+- **Sound:** PC speaker, AdLib (OPL2) and a Sound Blaster (8-bit, DMA;
+  new and untested on a board), over HDMI, S/PDIF or a
   one-pin sigma-delta output ([docs/sound.md](docs/sound.md)).
 - **Input:** USB keyboard and mouse, with an INT 33h mouse driver
   ([docs/mouse.md](docs/mouse.md)).
@@ -43,8 +46,8 @@ and shares its licence; a few vendored files have their own
   real 386, the gateware compared with a C model after every
   instruction, and the whole machine simulated down to its pins
   ([docs/verification.md](docs/verification.md)).
-- **Boards:** Sergei ML2 (ECP5 45F, DDR3; about 20,000 LUTs) and
-  Lakritz (ECP5 25F, SDRAM; about 17,000). Build rules, so far
+- **Boards:** Sergei ML2 (ECP5 45F, DDR3; about 23,000 LUTs) and
+  Lakritz (ECP5 25F, SDRAM; about 20,000). Build rules, so far
   untried, for Konfekt and Mozart ML0, ML1 and ML2
   ([docs/boards.md](docs/boards.md)). Built with Yosys and nextpnr.
 
@@ -56,9 +59,9 @@ not there.
 | | |
 |---|---|
 | **Works on a Sergei ML2** | DOS boots from the card; the measured speed is what the simulation predicts (`SPEED` prints 21.4 million instructions a second on a plain loop at 33.16 MHz; 20.3 at 31.5 before); the display; DDR3 memory; PC speaker and AdLib sound right, over HDMI too; the Monkey Island demo runs, with music, under `SLOW 5`; **DOOM's shareware episode runs** (round 26, at 33 MHz, about ten frames a second by eye, sound not yet tried) |
-| **Passes in simulation, not confirmed on a board** | The 486 instructions and protected mode beyond what DOOM uses. Also the mouse, the 640 x 350 and 640 x 480 modes, and the whole Lakritz build. The Konfekt and Mozart builds have not even been built into bitstreams. The USB keyboard has not been reported on either way |
+| **Passes in simulation, not confirmed on a board** | The 486 instructions and protected mode beyond what DOOM uses: privilege levels, paging and virtual 8086 mode (rounds 28 and 29; a 386 test suite passes on the core, and the Jemm386 memory manager runs DOS under it). Windows has not been tried anywhere. The Sound Blaster (round 30): its test and DOOM's sound run on the model and the simulated SoC. Also the mouse, the 640 x 350 and 640 x 480 modes, and the whole Lakritz build. The Konfekt and Mozart builds have not even been built into bitstreams. The USB keyboard has not been reported on either way |
 | **Not tested at all** | Any DOS extender but DOS/4GW, any protected-mode program but DOOM and our own tests |
-| **Not there yet** | Privilege levels, paging, virtual 8086 mode (so no EMM386, no Windows); an FPU; Sound Blaster; AdLib's rhythm mode; a mouse cursor in graphics modes |
+| **Not there yet** | Task switches; an FPU; AdLib's rhythm mode; a mouse cursor in graphics modes |
 
 ## Goals
 

@@ -66,7 +66,7 @@
  * A microcode ROM word, 90 bits (81 used), is a uop with holes plus sequencing:
  *
  *   [47:0]  uop    with literal fields
- *   [57:48] k      jump target, or a constant
+ *   [57:48] k      jump target, or a constant (its eleventh bit is [85])
  *   [58]    ujmp   jump to k after this uop   [59] only if ucc holds
  *   [63:60] ucc    condition for the jump
  *   [64]    end    last uop of the instruction
@@ -107,7 +107,7 @@
 
 module m86b_core #(
     parameter DC_AW = 11,
-    parameter UC_AW = 10,
+    parameter UC_AW = 11,
     parameter UCODE = "ucode.hex",
     parameter ATTR  = "attr.hex"
 ) (
@@ -137,6 +137,19 @@ module m86b_core #(
     output wire [31:0] e_addr,
     output wire [1:0]  e_size,
     output reg         d_io,        // the request is to an I/O port
+    // With paging on, an access that lies across two pages is made a
+    // byte at a time by the core itself. What it read that way is
+    // here; the core then reads it back as I/O port 1E8h, which the
+    // machine must answer with this (and whose writes it must ignore).
+    output reg  [31:0] x_rd,
+    // A byte of memory for someone else (the Sound Blaster's DMA): while
+    // dma_req is up the core reads the byte at dma_addr between two
+    // instructions and gives it on dma_q, with dma_ack up for a cycle.
+    // dma_req must then fall. (Tie dma_req low if nobody asks.)
+    input  wire        dma_req,
+    input  wire [23:0] dma_addr,
+    output reg         dma_ack,
+    output reg  [7:0]  dma_q,
 
     // Interrupts. inta is high for one cycle when a request is taken;
     // the vector is read from irq_vec at the end of that cycle.
@@ -160,11 +173,11 @@ module m86b_core #(
     // Decoded ahead: what of a uop the first logic of a cycle needs,
     // worked out when the uop is resolved and kept beside it (in the
     // cache: in bits its block RAMs had spare).
-    //   0 subtract  1 with carry  2 B is one (INC, DEC)  3 the adder's
-    //   result (not a logic operation's)  4 (not of the uop: the code
-    //   segment's D bit when the entry was made)  5 load-and-
-    //   operate  6 ALU with the immediate
-    localparam PW  = 7;
+    //   0 subtract  1 B is one (INC, DEC)  2 the adder's result (not a
+    //   logic operation's)  3 (not of the uop: the code segment's D
+    //   bit when the entry was made)  4 load-and-operate  5 ALU with
+    //   the immediate
+    localparam PW  = 6;
     // valid, generation, tag, length, continuation, decoded-ahead, uop,
     // context, imm, disp
     localparam DCW = 1 + GW + TW + 4 + UC_AW + PW + UW + CW + 32 + 32;
@@ -210,13 +223,19 @@ module m86b_core #(
         seg_base[k] = 32'd0; seg_sel[k] = 16'd0; seg_hi1[k] = 16'd1;
         seg_lim[k] = (k < 6) ? 32'h0000FFFF : 32'hFFFFFFFF;
     end
-    reg        sg_we;
+    reg        sg_we, sg_drop;
+    wire       sg_v86 = vm_ld;
     reg [2:0]  sg_wa;
     reg [15:0] sg_sel;
     reg        sg_pm;                   // from a descriptor: base and limit both
     reg [31:0] sg_base, sg_lim;
+    reg        sg_nl;                   // a null selector: base and limit stay
     always @(posedge clk)
-        if (sg_we) begin
+        if (sg_we && sg_nl)
+            seg_sel[sg_wa]  <= sg_sel;
+        else if (sg_we) begin
+            // (A virtual 8086 task's segments are 64 KB.)
+            if (sg_v86) seg_lim[sg_wa] <= 32'h0000FFFF;
             seg_sel[sg_wa]  <= sg_sel;
             seg_base[sg_wa] <= sg_base;
             seg_hi1[sg_wa]  <= sg_base[31:16] + 16'd1;
@@ -260,7 +279,112 @@ module m86b_core #(
     reg [15:0]        ldt_lim;
     reg               sel_ok;           // the selector last looked up names a descriptor
     reg               in_flt;           // the microcode running is delivering a fault
+    // ---- privilege levels (docs/pmode.md) ----
+    // The current level, and the level a transfer in progress is
+    // going to (the same, between instructions). A code segment load
+    // with PE set makes the second the first.
+    reg [1:0]         cpl /* verilator public_flat_rw */;
+    reg [1:0]         tpl;
+    reg [15:0]        err;              // the error code of the fault being raised
+    reg               ud_keep;          // ... which a RAISE says to keep
+    reg               in_hw;            // the microcode running is delivering a hardware interrupt
+    wire              ext = in_flt || in_hw;
+    // Virtual 8086 mode: EFLAGS.VM with PE set. Segment loads are then
+    // real mode's and the level is 3. vm_ld: the microcode is loading
+    // a virtual 8086 task's registers (IRET from level 0) and wants
+    // loads of that kind already. vm_int: it is on the way out of one,
+    // into a handler: VM is clear, but the flags it pushes say VM.
+    reg               vm_ld, vm_int;
+    // What a descriptor said of each segment: loaded with a null
+    // selector, not writable, not readable, its level, and whether an
+    // outer level loses it (data, or code that is not conforming).
+    reg [5:0]         sg_null, sg_nw, sg_nr, sg_prot;
+    reg [11:0]        sg_dpl;
+    // What the last look at a descriptor found.
+    reg               chk_ok, chk_p, chk_a, chk_sys, chk_inner, gate_trap;
+    reg [31:0]        new_lim;          // the limit of the code segment looked at
+    reg [31:0]        pm_hi;            // the descriptor's second half
+    reg               sel_null;         // the selector being loaded is a null selector
+    reg [31:0]        tr_base;
+    reg               tr_32;            // the task state segment is a 386's
+    reg [15:0]        ss_prev;          // the stack segment before the last load of SS
+    reg [31:0]        tss_sp;           // where the TSS keeps the stack of the level being gone to
+    always @(posedge clk)
+        tss_sp <= tr_base + (tr_32 ? {27'd0, tpl, 3'b100} : {28'd0, tpl, 2'b10});
+    // Where the top of the stack was, in memory, when the instruction began.
+    reg [31:0]        ostk;
+    always @(posedge clk)
+        ostk <= seg_base[2] + (ss_b ? esp0 : {16'd0, esp0[15:0]});
     reg [31:0] cs_base /* verilator public_flat_rw */;
+
+    // ---- paging (docs/pmode.md) ----
+    // With CR0.PG set every memory access of a uop, and every fetch of
+    // the decoder, waits for this unit first: it looks the page up in
+    // a translation buffer (32 entries, one per value of address bits
+    // 16:12), walks the page tables itself when it is not there, sets
+    // the accessed and dirty bits, and raises the page fault. The uop
+    // or the fetch then goes ahead with the physical address. The
+    // cost is two cycles an access, and nothing when paging is off.
+    wire       pg = cr0[31] && cr0[0];
+    localparam [3:0] X_IDLE = 4'd0, X_LOOK = 4'd1, X_RDY = 4'd2, X_W1 = 4'd3, X_W2 = 4'd4,
+                     X_W3 = 4'd5, X_W4 = 4'd6, X_W5 = 4'd7, X_W6 = 4'd8, X_W7 = 4'd9,
+                     X_W8 = 4'd10, X_BI = 4'd11, X_BW = 4'd12, X_IOA = 4'd13, X_IOB = 4'd14,
+                     X_IOC = 4'd15;
+    localparam [4:0] X_D1 = 5'd16, X_D2 = 5'd17;
+    reg [4:0]  xs /* verilator public_flat */;
+    reg [31:0] x_lin;               // the linear address
+    reg [19:0] x_cur;               // the page being looked up (the second, of an access across two)
+    reg        x_wr, x_rmw;         // a write; the read of a read-modify-write
+    reg        x_user;              // made at level 3 (the core's own are not)
+    reg        x_dec;               // for the decoder
+    reg        x_cross, x_second;   // across two pages; on the second
+    reg        x_wok;               // looked up as a write
+    reg        x_st;                // the bytes are to be written
+    // The same unit asks the task state segment whether a port may be
+    // used (outside the I/O privilege level, and always in virtual
+    // 8086 mode): 1 it is reading where the permission map begins,
+    // 2 the map's bits for the port; 3 on its way from one to the other.
+    reg [1:0]  x_io;
+    reg [19:0] tr_lim;
+    reg [31:0] tr_io;               // where the TSS says where its map is
+    always @(posedge clk)
+        tr_io <= tr_base + 32'h66;
+    reg [1:0]  x_size;
+    reg [19:0] x_ppn, x_ppn2;
+    reg [31:0] x_pde, x_pte;
+    reg [12:0] x_off;
+    reg [2:0]  x_i;
+    reg        xf_now;              // a page fault is being raised
+    reg        un_new;              // no uop of this instruction has run yet
+    reg        x_flush;             // empty the instruction cache: the mapping changed
+    reg [31:0] tlb_v;
+    (* ram_style = "distributed" *)
+    reg [37:0] tlb [0:31];          // dirty, writable, user, page frame, tag
+    initial for (k = 0; k < 32; k = k + 1) tlb[k] = 38'd0;
+    wire [37:0] tlb_q = tlb[x_cur[4:0]];
+    wire        tlb_hit = tlb_v[x_cur[4:0]] && (tlb_q[14:0] == x_cur[19:5]);
+    wire [19:0] tlb_ppn = pg ? tlb_q[34:15] : x_cur;
+    wire        x_wall = !x_user && !cr0[16];       // level 0 writes anything, without CR0.WP
+    // (Without paging the unit only ever looks at the TSS, where it is.)
+    wire        tlb_ok = !pg || (tlb_hit && (!x_user || tlb_q[35]) &&
+                                 (!x_wr || (tlb_q[37] && (tlb_q[36] || x_wall))));
+    wire [2:0]  x_bytes = (x_size == 2'd0) ? 3'd1 : (x_size == 2'd1) ? 3'd2 : 3'd4;
+    wire [12:0] x_last = {1'b0, x_lin[11:0]} + {10'd0, x_bytes} - 13'd1;
+    wire        x_crosses = x_last[12] && pg;
+    wire        x_pu = x_pde[2] && x_pte[2];
+    wire        x_pw = x_pde[1] && x_pte[1];
+    wire        x_wal = x_pw || x_wall;
+    wire [31:0] x_pa = {x_off[12] ? x_ppn2 : x_ppn, x_off[11:0]};
+    wire [31:0] x_addr = x_cross ? 32'h000001E8 : {x_ppn, x_lin[11:0]};
+    wire [31:0] x_pdea = {cr3[31:12], x_cur[19:10], 2'b00};
+    // (The port's number is registered as the question is asked: it
+    // comes out of the address adder.)
+    reg  [15:0] x_port;
+    wire [15:0] io_last = x_port + {14'd0, e_size == 2'd2, e_size == 2'd1} + {15'd0, e_size == 2'd2};
+    wire [3:0]  io_mask = (e_size == 2'd0) ? 4'b0001 : (e_size == 2'd1) ? 4'b0011 : 4'b1111;
+    wire [31:0] x_ptea = {x_pde[31:12], x_cur[9:0], 2'b00};
+    // The frames the instruction being decoded begins and ends in.
+    reg [19:0] i_ppn, i_ppn_e;
 
     // ---- decoded-instruction cache -----------------------------------
 
@@ -311,6 +435,8 @@ module m86b_core #(
     reg           st_chk /* verilator public_flat */;
     reg           dc_fill;
     reg           cm2_pend;
+    reg           fill_r;
+    reg  [31:0]   f_pa, f_pe;
     reg  [14:0]   cm2_blk;
     reg           cm_clr;           // a block found to hold no cached instruction
     reg  [14:0]   cm_clr_blk;
@@ -327,31 +453,38 @@ module m86b_core #(
         cmap_q <= cmap[d_addr[20:6]];
         // An instruction's first and last bytes may lie in two blocks;
         // the second is marked a cycle later.
-        if (dc_fill) cmap[i_lin[20:6]] <= gen;
+        // (The marks are made a cycle after the entry: where the
+        // instruction is, in memory, is registered first. The first
+        // store that could matter is later than that.)
+        fill_r <= dc_fill;
+        f_pa   <= i_pa;
+        f_pe   <= i_pe;
+        if (fill_r) cmap[f_pa[20:6]] <= gen;
         else if (cm2_pend) cmap[cm2_blk] <= gen;
         else if (cm_clr) cmap[cm_clr_blk] <= {GW{1'b0}};
-        cm2_pend <= dc_fill && (i_end[20:6] != i_lin[20:6]);
-        cm2_blk  <= i_end[20:6];
+        cm2_pend <= fill_r && (f_pe[20:6] != f_pa[20:6]);
+        cm2_blk  <= f_pe[20:6];
     end
-    // Above two megabytes the map is coarser: a mark for each 4 KB,
+    // Above two megabytes the map is coarser: a mark for each 32 KB,
     // of 64 MB (addresses 64 MB apart share one, which costs only
-    // time). A store to a marked page is followed by the search for
-    // the instructions it overlaps, as below two megabytes, but the
-    // page is not looked through and its mark never taken off: a
-    // page of code and data mixed pays about twenty cycles a store.
-    (* no_rw_check *)
-    reg  [GW-1:0] cmaph [0:16383];
+    // time), in LUT RAM: block RAM is what Lakritz has none of. A
+    // store to a marked page is followed by the search for the
+    // instructions it overlaps, as below two megabytes, but the page
+    // is not looked through and its mark never taken off: a page of
+    // code and data mixed pays about twenty cycles a store.
+    (* ram_style = "distributed" *)
+    reg  [GW-1:0] cmaph [0:2047];
     reg  [GW-1:0] cmaph_q;
     reg           cmh_pend;
-    reg  [13:0]   cmh_blk;
-    initial for (k = 0; k < 16384; k = k + 1) cmaph[k] = {GW{1'b0}};
-    wire          i_hi = (i_lin[31:21] != 11'd0);
+    reg  [10:0]   cmh_blk;
+    initial for (k = 0; k < 2048; k = k + 1) cmaph[k] = {GW{1'b0}};
+    wire          f_hi = (f_pa[31:21] != 11'd0);
     always @(posedge clk) begin
-        cmaph_q <= cmaph[d_addr[25:12]];
-        if (dc_fill && i_hi) cmaph[i_lin[25:12]] <= gen;
+        cmaph_q <= cmaph[d_addr[25:15]];
+        if (fill_r && f_hi) cmaph[f_pa[25:15]] <= gen;
         else if (cmh_pend) cmaph[cmh_blk] <= gen;
-        cmh_pend <= dc_fill && i_hi && (i_end[25:12] != i_lin[25:12]);
-        cmh_blk  <= i_end[25:12];
+        cmh_pend <= fill_r && f_hi && (f_pe[25:15] != f_pa[25:15]);
+        cmh_blk  <= f_pe[25:15];
     end
 
     // ---- state ----------------------------------------------------------
@@ -360,6 +493,8 @@ module m86b_core #(
     reg [31:0] lk_lin /* verilator public_flat_rw */;
     reg        lk_pend /* verilator public_flat_rw */;
     reg [18:0] fl /* verilator public_flat_rw */;   // EFLAGS bits 18..0 (18: AC, a 486's)
+    wire       v86 = cr0[0] && fl[17];
+    wire       pmode = cr0[0] && !fl[17] && !vm_ld;     // segment loads go through descriptors
     reg        in_rom;          // executing from the microcode ROM
     reg        s1_v, s2_v;      // ROM word fetched; ROM uop ready
     reg [UC_AW-1:0] upc1;       // address of the word in ur_q
@@ -390,6 +525,9 @@ module m86b_core #(
     // ---- resolving a ROM word against the instruction -------------------
 
     wire [31:0] i_end = i_lin + {28'd0, i_len} - 32'd1;   // the instruction's last byte
+    // (Where they are in memory: that is what stores are compared with.)
+    wire [31:0] i_pa = pg ? {i_ppn, i_lin[11:0]} : i_lin;
+    wire [31:0] i_pe = pg ? {i_ppn_e, i_end[11:0]} : i_end;
     wire [1:0] c_mod = c_modrm[7:6];
     wire [2:0] c_reg = c_modrm[5:3];
     wire [2:0] c_rm  = c_modrm[2:0];
@@ -463,6 +601,7 @@ module m86b_core #(
     endfunction
 
     wire [RW-1:0] w = ur_q;
+    wire [UC_AW-1:0] w_k = {w[85], w[57:48]};
     // (Bit 87: the size is the stack's width. Bit 86, below: so is
     // the offset's.)
     wire [1:0] w_size = w[87] ? (ss_b ? 2'd2 : 2'd1) :
@@ -518,7 +657,6 @@ module m86b_core #(
         w_aop == 4'd0 || w_aop == 4'd2 || w_aop == 4'd3 || w_aop == 4'd5 ||
             w_aop == 4'd7 || w_aop == 4'd8 || w_aop == 4'd9,
         w_aop == 4'd8 || w_aop == 4'd9,
-        w_aop == 4'd2 || w_aop == 4'd3,
         w_aop == 4'd3 || w_aop == 4'd5 || w_aop == 4'd7 || w_aop == 4'd9 };
 
     // The ROM uop ready to execute, with its sequencing.
@@ -526,6 +664,7 @@ module m86b_core #(
     reg [PW-1:0]    r_pre;
     reg [UC_AW-1:0] r_k;
     reg             r_ujmp, r_ucond, r_end, r_usek, r_ucz, r_ucx, r_uca, r_ucpe, r_ucflt;
+    reg             r_pj;           // a protection condition, already chosen and settled
     reg [3:0]       r_ucc;
 
     // ---- the uop being executed -----------------------------------------
@@ -540,7 +679,7 @@ module m86b_core #(
     // finishes even if the cache is emptied under it by an earlier store.
     wire       hit   = lk_pend && ((!in_rom && (cyc2 || cyc3)) ||
                        (!flushing && q_v && q_gen == gen && q_tag == lk_lin[31:DC_AW] &&
-                        q_pre[4] == cs_d && mode_ok));
+                        q_pre[3] == cs_d && mode_ok));
     // An interrupt request is taken between instructions, and not
     // straight after an instruction that holds interrupts off for one
     // more (a load of SS, or STI).
@@ -548,7 +687,7 @@ module m86b_core #(
     reg        rst_seq /* verilator public_flat_rw */;   // the reset microcode is running
     // Between instructions: nothing has begun.
     wire       between  = !rst && lk_pend && !in_rom && !jt_pend && !flt_now &&
-                          !cyc2 && !cyc3;
+                          !cyc2 && !cyc3 && (xs == X_IDLE);
 
     // A store into a block that holds cached instructions. The entries
     // of the instructions it overlaps are found and removed, between
@@ -581,8 +720,12 @@ module m86b_core #(
     wire       probe_take /* verilator public_flat */ = between && pr_v && !probing;
     reg  [7:0] sl_cnt;
     reg        sl_hold;                 // waiting (sl_cnt is not zero)
-    wire       phold = probe_take || probing || sl_hold;
-    wire       p_match = p_ev && dc_q[DCW-1] && q_tag == p_evaddr[31:DC_AW] &&
+    // A byte wanted from outside is fetched here too, when no store
+    // is waiting to be looked into.
+    wire       dma_take = between && dma_req && !dma_ack && !pr_v;
+    wire       phold = probe_take || probing || sl_hold || dma_take || xs[4];
+    wire       p_match = p_ev && dc_q[DCW-1] &&
+                         (pg ? (q_tag[0] == p_evaddr[DC_AW]) : (q_tag == p_evaddr[31:DC_AW])) &&
                          (p_dist <= 8'sd0 || $signed({4'b0000, q_len}) > p_dist);
     wire       p_kill /* verilator public_flat */ = p_match && !p_scan;
     reg [31:0] p_evaddr;
@@ -592,10 +735,13 @@ module m86b_core #(
     wire       hot   = !in_rom;
     wire [UW-1:0] uop = hot ? q_uop : r_uop;
     wire [PW-1:0] pre = hot ? q_pre : r_pre;
-    wire       p_sub = pre[0], p_usec = pre[1], p_one = pre[2], p_arith = pre[3];
-    wire       p_loadop = pre[5], p_alui = pre[6];
-    wire       valid0 = !rst && !halted && !jt_pend && !flt_now && !irq_take && !phold &&
+    wire       p_sub = pre[0], p_one = pre[1], p_arith = pre[2];
+    wire       p_usec = (u_aop == 4'd2 || u_aop == 4'd3);   // (the carry in: not a hurry)
+    wire       p_loadop = pre[4], p_alui = pre[5];
+    wire       valid00 = !rst && !halted && !jt_pend && !flt_now && !irq_take && !phold &&
                         (hot ? hit : s2_v);
+    wire       xl_block;            // an access that the paging unit is not ready for
+    wire       valid0 = valid00 && !xl_block;
     wire       st_block;            // a store that the memory is not ready for
     wire       valid = valid0 && !st_block;
     wire       usek  = !hot && r_usek;
@@ -607,9 +753,11 @@ module m86b_core #(
     // A segment load sent to the descriptor routine is not the end;
     // the routine's own is, if the first was.
     wire        is_setseg = (u_unit == U_SPEC) && (u_aop == SP_SETSEG);
-    wire        pm_div = valid && is_setseg && cr0[0] && !in_pm;
+    // (A SETSEG with cc 2 empties a segment an outer level may not
+    // keep, on the spot.)
+    wire        pm_div = valid && is_setseg && pmode && !in_pm && !u_cc[1];
     wire        pm_fin = valid && is_setseg && in_pm;
-    wire        last = !is_setseg ? last0 : in_pm ? pm_last : (last0 && !cr0[0]);
+    wire        last = !is_setseg ? last0 : in_pm ? pm_last : (last0 && (!pmode || u_cc[1]));
     // Going there and coming back are jumps in the microcode.
     wire        pm_jump = (pm_div || (pm_fin && !pm_last)) && !hot;
     wire [31:0] cur_eip = (hot && !cyc2 && !cyc3) ? lk_eip : i_eip;
@@ -650,6 +798,14 @@ module m86b_core #(
 
     wire        is_mem  = (u_unit == U_LOAD || u_unit == U_LOADOP || u_unit == U_STORE);
     assign      st_block = valid0 && (u_unit == U_STORE) && !d_st_rdy;
+    // (A store that follows its load to the same place needs the unit
+    // again only if the load was not looked up as a write, or lies
+    // across two pages.)
+    wire        xl_need = is_mem && !cyc2 &&
+                          ((u_seg != 3'd7) ? (pg && (!relatch || x_cross || !x_wok))
+                                           : (cr0[0] && (fl[17] || cpl > fl[13:12])));
+    assign      xl_block = xl_need && !(xs == X_RDY && !x_dec);
+    wire        xl_start = valid00 && xl_need && (xs == X_IDLE);
     wire        relatch = (u_unit == U_STORE) && u_cc[1] && (u_br != 3'd1);
     wire        mem_ls  = (u_unit == U_LOAD || u_unit == U_STORE);
     wire        strstep = mem_ls && u_aupd && u_cc[0];      // as a string instruction
@@ -679,7 +835,7 @@ module m86b_core #(
                           lin_lo[15:0]};
 
     assign e_req  = valid && !stall && is_mem && !cyc2 && (u_unit != U_STORE) &&
-                    (u_seg != 3'd7);
+                    (u_seg != 3'd7) && !pg;
     assign e_addr = lin;
     assign e_size = u_cc[2] ? 2'd1 : u_size;
 
@@ -691,7 +847,10 @@ module m86b_core #(
     // check is one comparison.)
     reg [31:0] chk_off;
     reg [32:0] chk_lim;
-    reg        chk_ss;
+    reg        chk_ss, chk_bad;
+    wire       acc_bad = cr0[0] && (u_seg != 3'd7) && (u_seg != 3'd6) &&
+                         (sg_null[u_seg] ||
+                          ((u_unit == U_STORE) ? sg_nw[u_seg] : sg_nr[u_seg]));
     wire       lim_now = chk_v && (chk_lim[32] || chk_off > chk_lim[31:0]);
 
     // A jump target outside the code segment, likewise a cycle late.
@@ -713,7 +872,7 @@ module m86b_core #(
     // A fault found this cycle cancels the uop that is running.
     reg        ud_now;          // from the decoder or from microcode
     reg [7:0]  ud_vec;
-    wire       flt_now = lim_now || ud_now || jmp_bad;
+    wire       flt_now /* verilator public_flat */ = lim_now || ud_now || jmp_bad;
 
     // ---- ALU ----------------------------------------------------------------
 
@@ -747,6 +906,9 @@ module m86b_core #(
     wire [4:0]  sh_k   = sh_rt ? (5'd0 - sh_n) : sh_n;
     wire [32:0] pow2   = 33'd1 << sh_k;
     wire        sh_sx  = (u_aop == 4'd7);
+    // (The double shifts: see below.)
+    wire        sh_dbl  = (u_unit == U_SHIFT) && (u_aop[2:1] == 2'd1);
+    wire        sh_d16x = sh_dbl && (u_size == 2'd1) && sh_n[4] && (sh_n[3:0] != 4'd0);
     wire [31:0] va_rep = (u_size == 2'd0) ? {4{va[7:0]}} :
                          (u_size == 2'd1) ? {2{va[15:0]}} : va;
     wire        a_sign = (u_size == 2'd0) ? va[7] : (u_size == 2'd1) ? va[15] : va[31];
@@ -754,6 +916,7 @@ module m86b_core #(
     wire [32:0] m_a = (u_unit == U_MUL)
                         ? {u_aop[0] & a_sign, u_aop[0] ? (va | ({32{a_sign}} & ~smask)) : va}
                         : (u_aop[2:1] == 2'd0) ? {1'b0, va_rep}
+                        : sh_d16x ? {1'b0, vc[15:0], vc[15:0]}
                         : {sh_sx & a_sign, sh_sx ? (va | ({32{a_sign}} & ~smask)) : va};
     wire [32:0] m_b = (u_unit == U_MUL)
                         ? {u_aop[0] & b_sign, u_aop[0] ? (vb | ({32{b_sign}} & ~smask)) : vb}
@@ -765,6 +928,23 @@ module m86b_core #(
         m_b_r <= m_b;
         prod  <= m_a_r * m_b_r;
     end
+    // Kinds 2 and 3 are the double shifts, SHLD and SHRD: register A
+    // shifted, and the bits register C gives OR-ed in where A's left.
+    // Those are "the other half" of the same shift of C, which a
+    // second multiplier makes beside the first, so that a double
+    // shift is one uop like any other. (DOOM draws its floors with
+    // them.) With 16-bit operands and more than 16 places the
+    // hardware's result is C rotated; the first multiplier does that
+    // and the second's bits are left out.
+    reg  [31:0] m_c_r;
+    reg  [63:0] prod2;
+    always @(posedge clk) begin
+        m_c_r <= vc;
+        prod2 <= m_c_r * m_b_r[31:0];
+    end
+    wire [31:0] sh_oth = sh_d16x ? 32'd0 :
+                         (u_size == 2'd1) ? {16'd0, prod2[31:16]} :
+                         sh_rt ? prod2[31:0] : prod2[63:32];
     // Multiply: the upper half of the product, and whether it holds
     // more than the sign (or zero) extension of the lower half.
     wire [31:0] mul_hi = (u_size == 2'd0) ? {24'd0, prod[15:8]} :
@@ -774,18 +954,11 @@ module m86b_core #(
     wire        mul_ov = mul_hi != ((u_aop[0] && mul_ls) ? smask : 32'd0);
 
     wire        sh_rot = (u_aop[2:1] == 2'd0);
-    // Kinds 2 and 3 (RCL and RCR are microcode) give the other half
-    // of a left or right shift: the bits that left the operand, at the
-    // end they would enter a neighbour at. SHLD and SHRD are made of
-    // a shift of one operand and this of the other.
-    wire        sh_oth = (u_aop[2:1] == 2'd1);
-    wire [31:0] sh_raw = sh_rot ? (prod[31:0] | prod[63:32]) :
-                         sh_oth ? ((u_size == 2'd1) ? {16'd0, prod[31:16]} :
-                                   sh_rt ? prod[31:0] : prod[63:32]) :
-                         sh_rt ? prod[63:32] : prod[31:0];
-    // A count of zero changes nothing (and nothing leaves).
+    wire [31:0] sh_raw = (sh_rot || sh_d16x) ? (prod[31:0] | prod[63:32]) :
+                         (sh_rt ? prod[63:32] : prod[31:0]) | (sh_dbl ? sh_oth : 32'd0);
+    // A count of zero changes nothing.
     wire        sh_nz  = (sh_n != 5'd0);
-    wire [31:0] sh_res = sh_nz ? (sh_raw & smask) : sh_oth ? 32'd0 : va;
+    wire [31:0] sh_res = sh_nz ? (sh_raw & smask) : va;
     wire        sh_msb = (u_size == 2'd0) ? sh_res[7] :
                          (u_size == 2'd1) ? sh_res[15] : sh_res[31];
     wire        sh_nxt = (u_size == 2'd0) ? sh_res[6] :
@@ -793,12 +966,13 @@ module m86b_core #(
     // A byte shifted by 16 or 24 reports the carry of a shift by 8
     // (observed on hardware).
     wire        sh_b8  = (u_size == 2'd0) && (sh_n == 5'd16 || sh_n == 5'd24);
-    wire        sh_cf  = sh_rot ? (sh_rt ? sh_msb : sh_res[0]) :
+    wire        sh_cf  = (sh_rot || sh_d16x) ? (sh_rt ? sh_msb : sh_res[0]) :
                          sh_rt  ? (sh_b8 && !sh_sx ? va[7] : prod[31]) :
                          sh_b8  ? va[0] :
                          (u_size == 2'd0) ? prod[8] :
                          (u_size == 2'd1) ? prod[16] : prod[32];
-    wire        sh_of  = sh_rot ? (sh_rt ? sh_msb ^ sh_nxt : sh_msb ^ sh_cf) :
+    wire        sh_of  = sh_dbl ? sh_msb ^ a_sign :      // the sign changed
+                         sh_rot ? (sh_rt ? sh_msb ^ sh_nxt : sh_msb ^ sh_cf) :
                          sh_sx  ? 1'b0 :
                          sh_rt  ? sh_nxt : sh_msb ^ sh_cf;
     wire        sh_pf  = ~^sh_res[7:0];
@@ -853,7 +1027,7 @@ module m86b_core #(
     always @* begin
         case (u_b)
             4'd0: sp_e = i_eip;
-            4'd1: sp_e = {13'd0, fl};
+            4'd1: sp_e = {13'd0, fl[18], vm_int, fl[16:0]};     // (VM shows only in an interrupt's frame)
             4'd2: sp_e = {16'd0, ss_q};
             4'd3: sp_e = cur_eip + {28'd0, len};
             4'd4: sp_e = imm;
@@ -866,12 +1040,17 @@ module m86b_core #(
             // of a descriptor whose second half is in A: 2 what LAR
             // gives, 3 what LSL gives (the first half in C), 1 whether
             // VERR (segment field even) or VERW (odd) accepts it.
-            4'd8: sp_e = (u_cc == 4'd2) ? (ra & 32'h00F0FF00) :
-                         (u_cc == 4'd3) ? (ra[23] ? {ra[19:16], rc[15:0], 12'hFFF}
-                                                  : {12'd0, ra[19:16], rc[15:0]}) :
-                         (u_cc == 4'd1) ? {31'd0, ra[12] && (u_seg[0] ? (!ra[11] && ra[9])
-                                                                      : (!ra[11] || ra[9]))} :
-                         sel_ok ? pm_desc : 32'd0;
+            4'd8: case (u_cc)
+                4'd2: sp_e = ra & 32'h00F0FF00;
+                4'd3: sp_e = ck_lim;
+                4'd12: sp_e = {16'd0, err};
+                // Where the task state segment keeps the stack of the
+                // level being gone to.
+                4'd13: sp_e = tss_sp;
+                4'd14: sp_e = ostk;
+                4'd15: sp_e = {16'd0, ss_prev};
+                default: sp_e = sel_ok ? pm_desc : 32'd0;
+            endcase
             4'd9: sp_e = cr0;
             4'd10: sp_e = {16'd0, gdt_lim};
             4'd11: sp_e = gdt_base;
@@ -895,6 +1074,65 @@ module m86b_core #(
         if (u_aop == SP_DIVR)
             sp_e = dv_r;
     end
+    // ---- a look at a descriptor (READ of R_DESC with a cc) ----
+    // Its second half is in A (in pm_hi for 4, the segment load's own
+    // look), its first in C; the selector is the one last looked up.
+    wire [31:0] ck_h   = (u_cc == 4'd4) ? pm_hi : ra;
+    wire [31:0] ck_lim = ck_h[23] ? {ck_h[19:16], rc[15:0], 12'hFFF}
+                                  : {12'd0, ck_h[19:16], rc[15:0]};
+    wire        ck_s = ck_h[12], ck_code = ck_h[11], ck_conf = ck_h[10], ck_rw = ck_h[9];
+    wire [1:0]  ck_dpl = ck_h[14:13], ck_rpl = pm_sel[1:0];
+    wire [3:0]  ck_type = ck_h[11:8];
+    wire        ck_vis = (ck_dpl >= cpl) && (ck_dpl >= ck_rpl);     // this level may name it
+    wire        ck_stack = ck_s && !ck_code && ck_rw && (ck_rpl == tpl) && (ck_dpl == tpl);
+    wire        ck_data = ck_s && (!ck_code || ck_rw) && ((ck_code && ck_conf) || ck_vis);
+    wire [15:0] ck_lar = 16'h1A3E, ck_lsl = 16'h0A0E;
+    reg         ck_ok, ck_in;
+    always @* begin
+        ck_in = 1'b0;
+        case (u_cc)
+            // VERR (segment field even) or VERW (odd).
+            4'd1: ck_ok = ck_s && (u_seg[0] ? (!ck_code && ck_rw) : (!ck_code || ck_rw)) &&
+                          ((ck_code && ck_conf) || ck_vis);
+            4'd2: ck_ok = (ck_s || ck_lar[ck_type]) && ((ck_s && ck_code && ck_conf) || ck_vis);
+            4'd3: ck_ok = (ck_s || ck_lsl[ck_type]) && ((ck_s && ck_code && ck_conf) || ck_vis);
+            // A segment register's load: SS by the stack's rule.
+            4'd4: ck_ok = sel_ok && ((pm_seg == 3'd2) ? ck_stack : ck_data);
+            4'd5: ck_ok = sel_ok && ck_stack;
+            // Code, named by a far jump or call.
+            4'd6: ck_ok = sel_ok && ck_s && ck_code &&
+                          (ck_conf ? (ck_dpl <= cpl) : (ck_rpl <= cpl && ck_dpl == cpl));
+            // Code behind a gate, called (an inner level is allowed) ...
+            4'd7: begin
+                // (Out of virtual 8086 mode: to level 0 only.)
+                ck_ok = sel_ok && ck_s && ck_code &&
+                        ((v86 || vm_int) ? (ck_dpl == 2'd0 && !ck_conf) : (ck_dpl <= cpl));
+                ck_in = !ck_conf && (ck_dpl < cpl);
+            end
+            // ... or jumped to.
+            4'd8: ck_ok = sel_ok && ck_s && ck_code &&
+                          (ck_conf ? (ck_dpl <= cpl) : (ck_dpl == cpl));
+            // Code returned to (an outer level is allowed).
+            4'd9: begin
+                ck_ok = sel_ok && (ck_rpl >= cpl) && ck_s && ck_code &&
+                        (ck_conf ? (ck_dpl <= ck_rpl) : (ck_dpl == ck_rpl));
+                ck_in = ck_rpl > cpl;
+            end
+            // A call gate. An interrupt or trap gate (software needs
+            // the gate's level; an interrupt or a fault does not).
+            4'd10: ck_ok = !ck_s && (ck_type == 4'd4 || ck_type == 4'd12) && ck_vis;
+            4'd11: ck_ok = !ck_s && (ck_h[10:9] == 2'b11) && (ext || ck_dpl >= cpl);
+            4'd13: ck_ok = tr_32;
+            default: ck_ok = 1'b0;
+        endcase
+    end
+    wire        ck_now = (u_unit == U_SPEC) && (u_aop == SP_READ) && (u_b == 4'd8) &&
+                         (u_cc != 4'd0) && (u_cc < 4'd12 || u_cc == 4'd13);
+
+    // With PE set IF changes only at or inside the I/O privilege
+    // level, and that level itself only at level 0.
+    wire        if_bad = cr0[0] && (cpl > fl[13:12]);
+    wire [15:0] wf_mask = imm[15:0] & ~{2'b00, {2{cr0[0] && cpl != 2'd0}}, 2'b00, if_bad, 9'd0};
     wire        is_lea = (u_unit == U_SPEC) && (u_aop == SP_LEA);
     wire [31:0] sp_val = is_lea ? off : sp_e;
 
@@ -905,12 +1143,13 @@ module m86b_core #(
     always @* begin
         case (u_b[2:0])
             3'd0: sp_st = i_eip;
-            3'd1: sp_st = {13'd0, fl};
+            3'd1: sp_st = {13'd0, fl[18], vm_int, fl[16:0]};
             3'd2: sp_st = {16'd0, ss_q};
             3'd3: sp_st = cur_eip + {28'd0, len};
             3'd4: sp_st = imm;
             3'd5: sp_st = disp;
-            3'd6: sp_st = {24'd0, flt_vec};
+            // (The descriptor's type byte, marked accessed.)
+            3'd6: sp_st = {24'd0, pm_hi[15:8] | 8'd1};
             default: sp_st = esp0;
         endcase
     end
@@ -924,7 +1163,8 @@ module m86b_core #(
     wire first     = two_cycle && !(slow_unit ? cyc3 : cyc2);
     wire stall     = cyc2 && is_mem && !d_ack;
     // (A divide is busy from its first cycle to the one before its last.)
-    wire busy      = (valid && (first || stall || (is_div && !dv_last))) || st_block;
+    wire busy      = (valid && (first || stall || (is_div && !dv_last))) || st_block ||
+                     (valid00 && xl_block);
 
     reg [31:0] result;
     always @* begin
@@ -991,10 +1231,32 @@ module m86b_core #(
                                taken ? ra_tk : ra_seq;
 
     wire fin  = valid && !busy && last;
+    // Conditions of the protection microcode: PE; a null selector for
+    // a data segment; the segment being loaded is CS; and what the
+    // last look at a descriptor found.
+    // (As they will be once the word now running is done: the word
+    // that asks is being fetched while the one that looks runs, and
+    // the answer is registered with it.)
+    wire [2:0] pm_seg_n = pm_div ? u_seg : pm_seg;
+    wire       sel_null_n = pm_div ? (va[15:2] == 14'd0) : sel_null;
+    // A second set (ROM bits 88 and 89 both): in virtual 8086 mode;
+    // there, and outside the I/O privilege level; coming out of it;
+    // at level 0; in protected mode proper.
+    wire [7:0] pcx = {3'd0, cr0[0] && !fl[17], cpl == 2'd0, vm_int,
+                      v86 && (fl[13:12] != 2'b11), v86};
+    wire       ck_x = ck_now && s2_v && in_rom;
+    wire [7:0] pcond = {ck_x ? ck_in : chk_inner,
+                        ck_x ? (sel_ok && !ck_s) : chk_sys,
+                        ck_x ? ck_h[8] : chk_a,
+                        ck_x ? ck_h[15] : chk_p,
+                        ck_x ? ck_ok : chk_ok,
+                        pm_seg_n == 3'd1,
+                        sel_null_n && pm_seg_n != 3'd1 && pm_seg_n != 3'd2,
+                        cr0[0]};
     wire done = (fin && u_br != 3'd3) || jt_pend;
     wire hot_fin = hot && valid && !busy && !last;
     wire ujump = valid && !busy && !hot && r_ujmp &&
-                 (!r_ucond || (r_ucpe ? (cr0[0] ^ r_ucc[0]) :
+                 (!r_ucond || (r_ucpe ? r_pj :
                                r_ucflt ? (in_flt ^ r_ucc[0]) :
                                r_uca ? !a_is1 :
                                r_ucx ? ((r_ucc[1] ? c_rep[1] : c_rep[0]) ^ r_ucc[0]) :
@@ -1005,7 +1267,7 @@ module m86b_core #(
     localparam [3:0] DS_IDLE = 4'd0, DS_PFX = 4'd1, DS_ATTR = 4'd2, DS_OPC = 4'd3,
                      DS_MODRM = 4'd4, DS_SIB = 4'd5, DS_DISP = 4'd6, DS_ATTR2 = 4'd7,
                      DS_IMMGO = 4'd8, DS_IMM = 4'd9, DS_IMM2 = 4'd10, DS_GO = 4'd11,
-                     DS_WAIT = 4'd12;
+                     DS_WAIT = 4'd12, DS_XL = 4'd13;
     reg [3:0]  ds /* verilator public_flat */;
     reg [3:0]  ds_next;
     reg [31:0] d_ip;
@@ -1033,7 +1295,16 @@ module m86b_core #(
                            d_modrm[5:3] != 3'd0) ||
                           (d_op == 8'hFE && d_modrm[5:3] > 3'd1))) ||
                         // (0F 00, SLDT and its kin, LAR and LSL: protected mode only.)
-                        (d_map && (d_op == 8'h00 || d_op == 8'h02 || d_op == 8'h03) && !cr0[0]);
+                        (d_map && (d_op == 8'h00 || d_op == 8'h02 || d_op == 8'h03) &&
+                         (!cr0[0] || fl[17])) ||
+                        (!d_map && d_op == 8'h63 && (!cr0[0] || fl[17]));     // (and ARPL)
+    // What only level 0 may do. These are never cached: the level is
+    // looked at as they are decoded.
+    wire       d_priv = d_map ? (d_op == 8'h06 || d_op == 8'h08 || d_op == 8'h09 ||
+                                 d_op[7:2] == 6'b001000 ||
+                                 (d_op == 8'h00 && d_modrm[5:4] == 2'b01) ||
+                                 (d_op == 8'h01 && (d_modrm[5:4] == 2'b01 || d_modrm[5:4] == 2'b11)))
+                              : (d_op == 8'hF4);
     reg [2:0]  d_ovr;
     reg [31:0] d_disp, d_imm;
     reg        dreq_r, dwr_r;
@@ -1054,7 +1325,8 @@ module m86b_core #(
 
     // What is written to a register, apart from the adder's sum.
     wire        wr_aupd = is_mem && u_aupd && !cyc2;        // a pointer moves
-    wire        wr_undo = (lim_now && un0_v) || un_second;
+    wire        und_now = lim_now || xf_now;
+    wire        wr_undo = (und_now && un0_v) || un_second;
     wire        wr_ah   = (u_size == 2'd0) && u_hi[2] && !wr_aupd;
     wire        wr_alu  = (u_unit == U_ALU || u_unit == U_ALUI || u_unit == U_LOADOP ||
                            u_unit == U_STORE);
@@ -1069,7 +1341,7 @@ module m86b_core #(
             default:  res_e = alu_other;
         endcase
     end
-    wire [31:0] wr_early = (lim_now && un0_v) ? un0_d : un_second ? un1_d :
+    wire [31:0] wr_early = (und_now && un0_v) ? un0_d : un_second ? un1_d :
                            wr_aupd ? ptr_sum : is_lea ? off :
                            wr_ah ? {16'd0, res_e[7:0], 8'd0} : res_e;
 
@@ -1090,7 +1362,7 @@ module m86b_core #(
             rf_we = 1'b0;
         // Putting string pointers back after a fault (nothing else
         // writes in these two cycles).
-        if (lim_now && un0_v) begin
+        if (und_now && un0_v) begin
             rf_we = 1'b1; rf_wa = un0_r; rf_lane = 4'b1111;
         end else if (un_second) begin
             rf_we = 1'b1; rf_wa = un1_r; rf_lane = 4'b1111;
@@ -1101,18 +1373,24 @@ module m86b_core #(
         rf_wd = wr_sum ? {alu_sum[31:16], wr_ah ? alu_sum[7:0] : alu_sum[15:8], alu_sum[7:0]}
                        : wr_early;
 
-        sg_we  = valid && is_setseg && !pm_div;
+        // A segment an outer level may not keep is emptied (cc 2).
+        sg_drop = cr0[0] && !in_pm && u_cc[1] && !sg_null[u_seg] && sg_prot[u_seg] &&
+                  ({sg_dpl[{u_seg, 1'b1}], sg_dpl[{u_seg, 1'b0}]} < cpl);
+        sg_we  = valid && is_setseg && !pm_div && (!(cr0[0] && !in_pm && u_cc[1]) || sg_drop);
         sg_wa  = pm_fin ? pm_seg : u_seg;
-        sg_sel = pm_fin ? pm_sel : va[15:0];
+        sg_nl  = (pm_fin && u_cc[0]) || sg_drop;
+        // (CS takes the level being gone to as its selector's.)
+        sg_sel = sg_drop ? 16'd0 :
+                 pm_fin ? ((pm_seg == 3'd1) ? {pm_sel[15:2], tpl} : pm_sel) : va[15:0];
         sg_pm  = pm_fin;
-        // The descriptor: A has its second half, pm_lo its first.
-        sg_base = pm_fin ? {va[31:24], va[7:0], pm_lo[31:16]} : {12'd0, va[15:0], 4'd0};
-        sg_lim  = va[23] ? {va[19:16], pm_lo[15:0], 12'hFFF}
-                         : {12'd0, va[19:16], pm_lo[15:0]};
+        // The descriptor's two halves were kept as they were read.
+        sg_base = pm_fin ? {pm_hi[31:24], pm_hi[7:0], pm_lo[31:16]} : {12'd0, va[15:0], 4'd0};
+        sg_lim  = pm_hi[23] ? {pm_hi[19:16], pm_lo[15:0], 12'hFFF}
+                            : {12'd0, pm_hi[19:16], pm_lo[15:0]};
 
         // The first uop of a newly decoded instruction goes to the cache
         // as it moves from the ROM to execution.
-        dc_fill = i_first && s1_v && !busy && !flt_now && !flushing && mode_ok;
+        dc_fill = i_first && s1_v && !busy && !flt_now && !flushing && mode_ok && !d_priv;
         dc_we = dc_fill || flushing || p_kill;
         dc_wa = flushing ? fl_idx : p_kill ? p_evaddr[DC_AW-1:0] : i_lin[DC_AW-1:0];
         dc_wd = {1'b1, gen, i_lin[31:DC_AW], i_len,
@@ -1122,14 +1400,14 @@ module m86b_core #(
                  // (the microassembler checks).
                  w[64] ? {UC_AW{1'b0}} :
                  (w[58] && (!w[59] || (w[83] && ((w[61] ? c_rep[1] : c_rep[0]) ^ w[60]))))
-                     ? w[57:48] : upc1 + 1'b1,
+                     ? w_k : upc1 + 1'b1,
                  w_pre, w_res, i_ctx,
                  // A constant from the ROM word takes the place of the
                  // immediate and displacement, as it does when the word
                  // runs from the ROM. Only single-uop instructions use
                  // this (the microassembler checks).
-                 w[65] ? {{(32-UC_AW){w[57]}}, w[57:48]} : i_imm,
-                 w[65] ? {{(32-UC_AW){w[57]}}, w[57:48]} : i_disp};
+                 w[65] ? {{(32-UC_AW){w_k[UC_AW-1]}}, w_k} : i_imm,
+                 w[65] ? {{(32-UC_AW){w_k[UC_AW-1]}}, w_k} : i_disp};
         if (flushing || p_kill)
             dc_wd = {DCW{1'b0}};
 
@@ -1139,13 +1417,13 @@ module m86b_core #(
         dc_ra = rst ? {DC_AW{1'b0}} :
                 probe_take ? pr_addr[DC_AW-1:0] - 4'd14 :
                 probing ? (p_restore ? lk_lin[DC_AW-1:0] : p_cand[DC_AW-1:0]) :
-                sl_hold ? lk_lin[DC_AW-1:0] :     // waiting: the next instruction's again
+                (sl_hold || dma_take || xs[4]) ? lk_lin[DC_AW-1:0] :  // waiting: the next instruction's again
                 ra_next;
 
         // Where the microcode goes on, if nothing sends it elsewhere.
         if (go)
-            ur_n = attr_q[9:0] + (attr_q[16] ? {7'd0, d_modrm[5:3]} : 10'd0)
-                               + {9'd0, d_rep[0] && d_str};
+            ur_n = {1'b0, attr_q[9:0]} + (attr_q[16] ? {8'd0, d_modrm[5:3]} : 11'd0)
+                               + {10'd0, d_rep[0] && d_str};
         else if (hot && hit && !cyc2 && !cyc3)
             ur_n = q_cont;
         else if (ujump)
@@ -1174,15 +1452,28 @@ module m86b_core #(
     // Ask for instruction bytes. The request is made at once; whether
     // it may be made is checked in the next cycle, from registers, by
     // one comparator for all the places that fetch (fetch_bad).
+    wire [31:0] f_lin = cs_base + d_ip;
     task dfetch(input [1:0] size, input [3:0] next);
         begin
-            dreq_r  <= 1'b1;
-            dwr_r   <= 1'b0;
-            d_io    <= 1'b0;
-            d_addr  <= cs_base + d_ip;
             d_size  <= size;
-            ds      <= DS_WAIT;
             ds_next <= next;
+            if (pg) begin
+                // The paging unit first; DS_XL makes the request.
+                x_lin  <= cs_base + d_ip;
+                x_cur  <= f_lin[31:12];
+                x_wr   <= 1'b0;  x_rmw <= 1'b0;  x_st <= 1'b0;
+                x_user <= (cpl == 2'd3);
+                x_size <= size;
+                x_dec  <= 1'b1;  x_second <= 1'b0;  x_io <= 2'd0;
+                xs     <= X_LOOK;
+                ds     <= DS_XL;
+            end else begin
+                dreq_r  <= 1'b1;
+                dwr_r   <= 1'b0;
+                d_io    <= 1'b0;
+                d_addr  <= cs_base + d_ip;
+                ds      <= DS_WAIT;
+            end
         end
     endtask
 
@@ -1229,6 +1520,10 @@ module m86b_core #(
         end
         ud_now <= 1'b0;
         ud_vec <= 8'd6;
+        ud_keep <= 1'b0;
+        x_flush <= 1'b0;
+        xf_now  <= 1'b0;
+        dma_ack <= 1'b0;
 
         if (rst) begin
             // Reset continues in microcode, from word 0, which sets the
@@ -1242,6 +1537,13 @@ module m86b_core #(
             cr0 <= 32'd0; cr2 <= 32'd0; cr3 <= 32'd0; in_pm <= 1'b0;
             cs_d <= 1'b0; ss_b <= 1'b0; ldt_sel <= 16'd0; tr_sel <= 16'd0;
             ldt_base <= 32'd0; in_flt <= 1'b0; ldt_lim <= 16'd0; sel_ok <= 1'b1;
+            cpl <= 2'd0; tpl <= 2'd0; err <= 16'd0; in_hw <= 1'b0; sg_null <= 6'd0;
+            xs <= X_IDLE; tlb_v <= 32'd0; x_cross <= 1'b0; x_wok <= 1'b0; x_dec <= 1'b0;
+            xf_now <= 1'b0; un_new <= 1'b1; x_flush <= 1'b0; x_second <= 1'b0;
+            vm_ld <= 1'b0; vm_int <= 1'b0; x_io <= 2'd0; tr_lim <= 20'd0;
+            sg_nw <= 6'd0; sg_nr <= 6'd0; sg_prot <= 6'h3F; sg_dpl <= 12'd0;
+            chk_ok <= 1'b0; chk_p <= 1'b0; chk_a <= 1'b0; chk_sys <= 1'b0; chk_inner <= 1'b0;
+            gate_trap <= 1'b0; tr_base <= 32'd0; tr_32 <= 1'b0; sel_null <= 1'b0; chk_bad <= 1'b0;
             gdt_base <= 32'd0; gdt_lim <= 16'hFFFF; idt_base <= 32'd0; idt_lim <= 16'hFFFF;
             dreq_r <= 1'b0; dwr_r <= 1'b0; ds <= DS_IDLE; i_first <= 1'b0;
             inh <= 1'b0; inh_next <= 1'b0; d_io <= 1'b0; inta <= 1'b0;
@@ -1279,8 +1581,8 @@ module m86b_core #(
             end
 
             // String pointers to put back.
-            un_second <= lim_now && un1_v;
-            if (lim_now || un_second) begin
+            un_second <= und_now && un1_v;
+            if (und_now || un_second) begin
                 un0_v <= 1'b0;
                 if (un_second || !un1_v) un1_v <= 1'b0;
             end else if (valid && !stall && !cyc2 && !cyc3) begin
@@ -1365,10 +1667,11 @@ module m86b_core #(
 
             // ROM pipeline: the fetched word becomes the uop to execute.
             if (!busy) begin
-                r_uop <= w_res;  r_pre <= w_pre;  r_k <= w[57:48];  r_ujmp <= w[58];
+                r_uop <= w_res;  r_pre <= w_pre;  r_k <= w_k;  r_ujmp <= w[58];
                 r_ucond <= w[59]; r_ucc <= w[63:60]; r_end <= w[64];
                 r_ucz <= w[81];  r_ucx <= w[83];  r_uca <= w[84];
                 r_ucpe <= w[88]; r_ucflt <= w[89];
+                r_pj <= (w[89] ? pcx[w[63:61]] : pcond[w[63:61]]) ^ w[60];
                 r_usek <= w[65];
                 s2_v <= s1_v && (in_rom || hot_fin) && !ujump && !pm_jump;
                 // (hot_fin: a cached first uop that took two cycles has
@@ -1383,12 +1686,20 @@ module m86b_core #(
                 s2_v <= 1'b0;
             end
 
-            if (fin) in_flt <= 1'b0;
+            if (fin) begin in_flt <= 1'b0; in_hw <= 1'b0; vm_int <= 1'b0; tpl <= (sg_we && sg_wa == 3'd1 && sg_pm) ? tpl : cpl; end
+`ifdef M86_DBG
+            if (flt_now) $display("DBG fault lim=%b ud=%b jmp=%b vec=%h eip=%h upc=%h chk_off=%h chk_lim=%h bad=%b ss=%b err=%h cr2=%h",
+                                  lim_now, ud_now, jmp_bad, ud_vec, i_eip, upc1, chk_off, chk_lim, chk_bad, chk_ss, err, cr2);
+`endif
             if (flt_now) begin
                 // Deliver a fault: microcode takes over.
                 in_flt <= 1'b1;
-                flt_vec  <= ud_now ? ud_vec : (lim_now && chk_ss) ? 8'd12 : 8'd13;
-                last_exc <= ud_now ? ud_vec : (lim_now && chk_ss) ? 8'd12 : 8'd13;
+                flt_vec  <= ud_now ? ud_vec : (lim_now && chk_ss && !chk_bad) ? 8'd12 : 8'd13;
+                last_exc <= ud_now ? ud_vec : (lim_now && chk_ss && !chk_bad) ? 8'd12 : 8'd13;
+                if (!(ud_now && ud_keep)) err <= 16'd0;
+                in_pm <= 1'b0; tpl <= cpl; in_hw <= 1'b0; vm_ld <= 1'b0;
+                // (A fault on the way out of virtual 8086 mode: back in.)
+                if (vm_int) begin fl[17] <= 1'b1; vm_int <= 1'b0; end
                 in_rom <= 1'b1; lk_pend <= 1'b0; s1_v <= 1'b1; s2_v <= 1'b0;
                 cyc2 <= 1'b0; cyc3 <= 1'b0; ds <= DS_IDLE; i_first <= 1'b0;
                 dreq_r <= 1'b0;
@@ -1398,6 +1709,7 @@ module m86b_core #(
                 in_rom <= 1'b1; lk_pend <= 1'b0; s1_v <= 1'b1; s2_v <= 1'b0;
                 i_eip <= lk_eip; i_lin <= lk_lin; i_first <= 1'b0;
                 esp0 <= esp_now;
+                in_hw <= 1'b1;
                 inta <= 1'b1;
                 halted <= 1'b0;
             end else if (jt_pend) begin
@@ -1430,22 +1742,33 @@ module m86b_core #(
                 end
                 if (is_mem && !cyc2 && !relatch) begin
                     dreq_r  <= 1'b1;
-                    d_io    <= (u_seg == 3'd7);
+                    d_io    <= (u_seg == 3'd7) || (pg && x_cross);
                     dwr_r   <= (u_unit == U_STORE);
-                    d_addr  <= lin;
+                    d_addr  <= (pg && u_seg != 3'd7) ? x_addr : lin;
                     d_size  <= u_cc[2] ? 2'd1 : u_size;
                     d_wdata <= st_data;
                     chk_v     <= 1'b1;
                     chk_off   <= off;
-                    chk_lim   <= {1'b0, seg_lim[u_seg]} -
+                    // (No offset will do if the segment may not be
+                    // used this way, or the port not at this level.)
+                    chk_lim   <= acc_bad ? 33'h1_0000_0000 :
+                                 {1'b0, seg_lim[u_seg]} -
                                  {31'd0, u_cc[2] ? 2'd1 : (bytes[1:0] - 2'd1)};
+                    chk_bad   <= acc_bad;
                     chk_ss    <= (u_seg == 3'd2);
                 end
                 if (relatch) begin
                     dreq_r  <= 1'b1;
                     dwr_r   <= 1'b1;
                     d_wdata <= st_data;
+                    // (The paging unit may have used the bus since the load.)
+                    if (pg) begin
+                        d_addr <= x_addr;
+                        d_io   <= x_cross;
+                        d_size <= u_size;
+                    end
                 end
+                if (!cyc2 && !cyc3) un_new <= 1'b0;
                 cyc2 <= first && !cyc2;
                 cyc3 <= first && cyc2;
 
@@ -1479,8 +1802,8 @@ module m86b_core #(
                     // (Bits 16 and 17 are never written this way; bit
                     // 18 with a 32-bit operand and the whole mask.)
                     SP_WRFL:  fl <= {(u_size == 2'd2 && imm[15]) ? ra[18] : fl[18],
-                                     ((({fl[17:0]} & ~{2'd0, imm[15:0]}) |
-                                       (va[17:0] & {2'd0, imm[15:0]})) & 18'h37FD5) | 18'h2};
+                                     ((({fl[17:0]} & ~{2'd0, wf_mask}) |
+                                       (va[17:0] & {2'd0, wf_mask})) & 18'h37FD5) | 18'h2};
                     SP_SZP: begin               // sign, zero, parity of A
                         fl[6] <= (va == 32'd0);
                         fl[7] <= (u_size == 2'd0) ? va[7] :
@@ -1489,25 +1812,31 @@ module m86b_core #(
                     end
                     // (Real mode only: with PE set the new segment's
                     // limit is what counts, and the fetch finds out.)
-                    SP_CHKCS: if (va > cs_lim && !cr0[0]) begin
+                    SP_CHKCS: if (va > (pmode ? new_lim : cs_lim)) begin
                         // A far jump's offset is outside the code segment.
                         ud_now <= 1'b1;
                         ud_vec <= 8'd13;
                     end
                     SP_RAISE: begin
                         ud_now <= 1'b1;
-                        ud_vec <= imm[7:0];
+                        // (Not present, of a stack segment, is a stack fault.)
+                        ud_vec <= (imm[7:0] == 8'd11 && in_pm && pm_seg == 3'd2) ? 8'd12 : imm[7:0];
+                        ud_keep <= u_cc[0];
                     end
                     // A NOP with a condition code is a write to a
                     // system register, from A.
                     SP_NOP: if (u_br == 3'd0) case (u_cc)
-                        4'd1: cr0 <= va;
+                        4'd1: begin
+                            cr0 <= va;
+                            if (!va[0]) begin cpl <= 2'd0; tpl <= 2'd0; end
+                            if ((va[31] && va[0]) || pg) x_flush <= 1'b1;
+                        end
                         4'd2: gdt_lim <= va[15:0];
                         4'd3: gdt_base <= c_os32 ? va : {8'd0, va[23:0]};
                         4'd4: idt_lim <= va[15:0];
                         4'd5: idt_base <= c_os32 ? va : {8'd0, va[23:0]};
                         4'd6: cr2 <= va;
-                        4'd7: cr3 <= va;
+                        4'd7: begin cr3 <= va; if (pg) x_flush <= 1'b1; end
                         4'd8: cr0[3] <= 1'b0;               // CLTS
                         4'd9: cr0[3:0] <= {va[3:1], va[0] | cr0[0]};    // LMSW: PE stays set
                         // LLDT: the selector, and where its descriptor
@@ -1527,19 +1856,60 @@ module m86b_core #(
                         // one -- not the null selector, and inside its
                         // table.
                         4'd13: begin
+                            pm_sel  <= va[15:0];
                             pm_desc <= (va[2] ? ldt_base : gdt_base) + {16'd0, va[15:3], 3'd0};
                             sel_ok  <= (va[15:2] != 14'd0) &&
                                        ({va[15:3], 3'b111} <= (va[2] ? ldt_lim : gdt_lim));
                         end
                         4'd12: tr_sel <= va[15:0];
+                        // The level being gone to, and the error code
+                        // (the B field says which): 1 a descriptor's
+                        // level, 2 a selector's; 3 the selector last
+                        // looked up, 4 register A, as an error code.
+                        4'd14: case (u_b)
+                            4'd1: tpl <= va[14:13];
+                            4'd2: tpl <= va[1:0];
+                            4'd3: err <= {pm_sel[15:2], 1'b0, ext};
+                            4'd4: err <= {va[15:1], va[0] | ext};
+                            4'd5: if (pg) x_flush <= 1'b1;     // INVLPG
+                            // Virtual 8086 mode: 6 its registers are
+                            // being loaded; 7 into it; 8 out of it.
+                            4'd6: vm_ld <= 1'b1;
+                            4'd7: begin
+                                fl[17] <= 1'b1;  vm_ld <= 1'b0;
+                                cpl <= 2'd3;     tpl <= 2'd3;
+                            end
+                            4'd8: begin
+                                vm_int <= fl[17];
+                                fl[17] <= 1'b0;
+                            end
+                            default: ;
+                        endcase
+                        // LTR: where the task state segment is (A the
+                        // descriptor's second half, B its first).
+                        4'd15: begin
+                            tr_base <= {va[31:24], va[7:0], vb[31:16]};
+                            tr_32   <= va[11];
+                            tr_lim  <= {va[19:16], vb[15:0]};
+                        end
                         default: ;
                     endcase
                     SP_FLBIT: case (u_cc[3:1])
                         3'd0: fl[0]  <= u_cc[0];
-                        3'd1: fl[9]  <= u_cc[0];
+                        // (CLI and STI: not above the I/O privilege level.)
+                        3'd1: if (if_bad) begin
+                            ud_now <= 1'b1;
+                            ud_vec <= 8'd13;
+                        end else
+                            fl[9]  <= u_cc[0];
                         3'd2: fl[10] <= u_cc[0];
                         3'd3: fl[0]  <= ~fl[0];
-                        3'd4: begin fl[9] <= 1'b0; fl[8] <= 1'b0; end
+                        // (Into a handler: a trap gate leaves IF; NT goes.)
+                        3'd4: begin
+                            if (!(cr0[0] && gate_trap)) fl[9] <= 1'b0;
+                            fl[8] <= 1'b0;
+                            if (cr0[0]) fl[14] <= 1'b0;
+                        end
                         // Overflow: A's sign is not B's.
                         3'd5: fl[11] <= (u_size == 2'd0) ? va[7] ^ vb[7] :
                                         (u_size == 2'd1) ? va[15] ^ vb[15] : va[31] ^ vb[31];
@@ -1551,9 +1921,32 @@ module m86b_core #(
                 if (sg_we && sg_wa == 3'd1) begin
                     cs_base <= sg_base;
                     if (sg_pm) cs_lim <= sg_lim;
-                    if (sg_pm) cs_d <= va[22];
+                    if (sg_pm) cs_d <= pm_hi[22];
+                    if (sg_pm) cpl <= tpl;
+                    if (sg_v86) begin cs_lim <= 32'h0000FFFF; cs_d <= 1'b0; end
                 end
-                if (sg_we && sg_wa == 3'd2 && sg_pm) ss_b <= va[22];
+                if (sg_we && sg_wa == 3'd2 && sg_pm) ss_b <= pm_hi[22];
+                if (sg_we && sg_wa == 3'd2 && sg_v86) ss_b <= 1'b0;
+                if (sg_we && sg_wa == 3'd2) ss_prev <= seg_sel[2];
+                // The segment's rights: from the descriptor; none for
+                // a null selector; anything goes for a real-mode load.
+                if (sg_we && sg_wa < 3'd6) begin
+                    sg_null[sg_wa] <= sg_nl;
+                    if (!sg_nl) begin
+                        sg_nw[sg_wa]   <= sg_pm && (pm_hi[11] || !pm_hi[9]);
+                        sg_nr[sg_wa]   <= sg_pm && pm_hi[11] && !pm_hi[9];
+                        // (A real-mode load is level-0 data.)
+                        sg_prot[sg_wa] <= !sg_pm || !(pm_hi[11] && pm_hi[10]);
+                        sg_dpl[{sg_wa, 1'b1}] <= sg_pm ? pm_hi[14] : (v86 || vm_ld);
+                        sg_dpl[{sg_wa, 1'b0}] <= sg_pm ? pm_hi[13] : (v86 || vm_ld);
+                    end
+                end
+                if (valid && !busy && ck_now) begin
+                    chk_ok <= ck_ok;  chk_inner <= ck_in;
+                    chk_p  <= ck_h[15]; chk_a <= ck_h[8]; chk_sys <= sel_ok && !ck_s;
+                    if (u_cc == 4'd11) gate_trap <= ck_h[8];
+                    if (u_cc >= 4'd6 && u_cc <= 4'd9) new_lim <= ck_lim;
+                end
                 // The descriptor routine: in, and out again.
                 if (pm_div) begin
                     in_pm   <= 1'b1;
@@ -1564,12 +1957,16 @@ module m86b_core #(
                     pm_seg  <= u_seg;
                     pm_sel  <= va[15:0];
                     pm_desc <= (va[2] ? ldt_base : gdt_base) + {16'd0, va[15:3], 3'b000};
-                    sel_ok  <= 1'b1;
+                    sel_null <= (va[15:2] == 14'd0);
+                    sel_ok  <= (va[15:2] != 14'd0) &&
+                               ({va[15:3], 3'b111} <= (va[2] ? ldt_lim : gdt_lim));
                 end
                 if (pm_fin)
                     in_pm <= 1'b0;
-                if (in_pm && u_unit == U_LOAD && !first && !u_dwe)
-                    pm_lo <= result;
+                if (in_pm && u_unit == U_LOAD && !first && !u_dwe) begin
+                    if (u_disp) pm_hi <= result;
+                    else        pm_lo <= result;
+                end
 
                 if (fin && u_br == 3'd3) begin
                     jt_pend <= 1'b1;
@@ -1579,7 +1976,8 @@ module m86b_core #(
                     // (A word that raises a fault ends its routine, but
                     // the instruction is not done: the fault's delivery
                     // is the step.)
-                    if (!(u_unit == U_SPEC && u_aop == SP_RAISE)) begin
+                    if (!(u_unit == U_SPEC && (u_aop == SP_RAISE ||
+                                               (u_aop == SP_FLBIT && u_cc[3:1] == 3'd1 && if_bad)))) begin
                         step_done <= 1'b1;
                         dbg_insns <= dbg_insns + 32'd1;
                     end
@@ -1597,6 +1995,17 @@ module m86b_core #(
             // ---- the decoder ----
             if (!flt_now) case (ds)
                 DS_PFX: dfetch(2'd0, DS_OPC);
+                DS_XL: if (xs == X_RDY) begin
+                    dreq_r <= 1'b1;
+                    dwr_r  <= 1'b0;
+                    d_io   <= x_cross;
+                    d_addr <= x_addr;
+                    d_size <= x_size;
+                    xs     <= X_IDLE;
+                    ds     <= DS_WAIT;
+                    if (d_len == 4'd0) i_ppn <= x_ppn;
+                    i_ppn_e <= x_cross ? x_ppn2 : x_ppn;
+                end
                 DS_WAIT: if (fetch_bad) begin
                     ud_now <= 1'b1;
                     ud_vec <= 8'd13;
@@ -1699,6 +2108,10 @@ module m86b_core #(
                         (d_lock && attr_q[10] && !(d_ismem && attr_q[17] && grp_lock))) begin
                         ud_now <= 1'b1;
                         ds <= DS_IDLE;
+                    end else if (d_priv && cr0[0] && cpl != 2'd0) begin
+                        ud_now <= 1'b1;
+                        ud_vec <= 8'd13;
+                        ds <= DS_IDLE;
                     end else case (a_immk)
                         3'd0: ds <= DS_GO;
                         3'd1, 3'd4: dfetch(2'd0, DS_IMM);
@@ -1722,8 +2135,250 @@ module m86b_core #(
                 end
                 default: ;
             endcase
+
+            // ---- the paging unit ----
+            if (done || flt_now || irq_take) un_new <= 1'b1;
+            case (xs)
+                X_D1: begin
+                    d_addr <= {8'd0, dma_addr};  d_size <= 2'd0;  d_io <= 1'b0;
+                    dreq_r <= 1'b1;  dwr_r <= 1'b0;
+                    xs <= X_D2;
+                end
+                X_D2: if (d_ack) begin
+                    dma_q   <= d_rdata[7:0];
+                    dma_ack <= 1'b1;
+                    xs <= X_IDLE;
+                end else
+                    dreq_r <= 1'b1;
+                X_IDLE: if (dma_take)
+                    xs <= X_D1;
+                else if (xl_start && u_seg == 3'd7) begin
+                    // A port: is it allowed? A 386's TSS says, if it
+                    // is long enough to.
+                    x_lin  <= tr_io;
+                    x_cur  <= tr_io[31:12];
+                    x_wr   <= 1'b0;  x_rmw <= 1'b0;  x_st <= 1'b0;
+                    x_user <= 1'b0;  x_dec <= 1'b0;  x_second <= 1'b0;
+                    x_size <= 2'd1;
+                    x_io   <= 2'd1;
+                    x_port <= off[15:0];
+                    if (!tr_32 || tr_lim < 20'h67) begin
+                        ud_now <= 1'b1;
+                        ud_vec <= 8'd13;
+                    end else
+                        xs <= X_LOOK;
+                end else if (xl_start) begin
+                    x_io <= 2'd0;
+                    if (!relatch) begin
+                        x_lin  <= lin;
+                        x_cur  <= lin[31:12];
+                        x_wr   <= (u_unit == U_STORE) || (u_unit == U_LOAD && u_aop[3]);
+                        // (aop 8: a read-modify-write's read; 12: a look
+                        // ahead of a write, which is treated as the write.)
+                        x_rmw  <= (u_unit == U_LOAD && u_aop[3] && !u_aop[2]);
+                        // (On the way to an inner level the pushes are
+                        // already that level's.)
+                        x_user <= (cpl == 2'd3) && (tpl == 2'd3) && (u_seg != 3'd6);
+                        x_size <= e_size;
+                        x_st   <= (u_unit == U_STORE);
+                        // (The segment's check comes first, as it would.)
+                        chk_v   <= 1'b1;
+                        chk_off <= off;
+                        chk_lim <= acc_bad ? 33'h1_0000_0000 :
+                                   {1'b0, seg_lim[u_seg]} -
+                                   {31'd0, u_cc[2] ? 2'd1 : (bytes[1:0] - 2'd1)};
+                        chk_bad <= acc_bad;
+                        chk_ss  <= (u_seg == 3'd2);
+                        xs <= X_LOOK;
+                    end else begin
+                        // The store of a read-modify-write: as a write
+                        // now, if the load was not; then its bytes, if
+                        // it lies across two pages.
+                        x_cur <= x_lin[31:12];
+                        x_wr  <= 1'b1;  x_rmw <= 1'b0;  x_st <= 1'b1;
+                        x_off <= {1'b0, x_lin[11:0]};
+                        x_i   <= 3'd0;
+                        xs <= x_wok ? X_BI : X_LOOK;
+                    end
+                    x_dec <= 1'b0;
+                    x_second <= 1'b0;
+                end
+                X_LOOK: if (tlb_ok) begin
+                    if (x_second) x_ppn2 <= tlb_ppn;
+                    else begin
+                        x_ppn   <= tlb_ppn;
+                        x_cross <= x_crosses;
+                        x_wok   <= x_wr;
+                    end
+                    x_off <= {1'b0, x_lin[11:0]};
+                    x_i   <= 3'd0;
+                    if (!x_second && x_crosses) begin
+                        x_second <= 1'b1;
+                        x_cur    <= x_cur + 20'd1;
+                    end else if (x_second)
+                        xs <= X_BI;
+                    else
+                        xs <= (x_io != 2'd0) ? X_IOA : X_RDY;
+                end else
+                    xs <= X_W1;
+                // The walk: the directory entry, then the table's.
+                X_W1: begin
+                    d_addr <= x_pdea;  d_size <= 2'd2;  d_io <= 1'b0;
+                    dreq_r <= 1'b1;    dwr_r <= 1'b0;
+                    xs <= X_W2;
+                end
+                X_W2: if (d_ack) begin
+                    x_pde <= d_rdata;
+                    xs <= X_W3;
+                end else
+                    dreq_r <= 1'b1;
+                X_W3: if (!x_pde[0])
+                    page_fault(1'b0, x_wr && !x_rmw);
+                else begin
+                    d_addr <= x_ptea;  d_size <= 2'd2;  d_io <= 1'b0;
+                    dreq_r <= 1'b1;    dwr_r <= 1'b0;
+                    xs <= X_W4;
+                end
+                X_W4: if (d_ack) begin
+                    x_pte <= d_rdata;
+                    xs <= X_W5;
+                end else
+                    dreq_r <= 1'b1;
+                // Allowed? (A read-modify-write is first a read: its
+                // write is refused only after the accessed bits are set.)
+                X_W5: if (!x_pte[0])
+                    page_fault(1'b0, x_wr && !x_rmw);
+                else if (x_user && !x_pu)
+                    page_fault(1'b1, x_wr && !x_rmw);
+                else if (x_wr && !x_rmw && !x_wal)
+                    page_fault(1'b1, 1'b1);
+                else
+                    xs <= X_W6;
+                // The accessed bits, and the dirty bit of a page written.
+                X_W6: if (x_pde[5])
+                    xs <= X_W7;
+                else if (d_st_rdy) begin
+                    d_addr <= x_pdea;  d_size <= 2'd0;  d_io <= 1'b0;
+                    d_wdata <= {24'd0, x_pde[7:0] | 8'h20};
+                    dreq_r <= 1'b1;    dwr_r <= 1'b1;
+                    xs <= X_W7;
+                end
+                X_W7: if (x_pte[5] && !(x_wr && x_wal && !x_pte[6]))
+                    xs <= X_W8;
+                else if (d_st_rdy) begin
+                    d_addr <= x_ptea;  d_size <= 2'd0;  d_io <= 1'b0;
+                    d_wdata <= {24'd0, x_pte[7:0] | 8'h20 | ((x_wr && x_wal) ? 8'h40 : 8'h00)};
+                    dreq_r <= 1'b1;    dwr_r <= 1'b1;
+                    xs <= X_W8;
+                end
+                X_W8: if (x_wr && !x_wal)
+                    page_fault(1'b1, 1'b1);
+                else begin
+                    tlb[x_cur[4:0]]   <= {x_pte[6] || x_wr, x_pw, x_pu, x_pte[31:12], x_cur[19:5]};
+                    tlb_v[x_cur[4:0]] <= 1'b1;
+                    xs <= X_LOOK;
+                end
+                // An access across two pages, a byte at a time.
+                X_BI: if (x_st) begin
+                    if (d_st_rdy) begin
+                        d_addr <= x_pa;  d_size <= 2'd0;  d_io <= 1'b0;
+                        d_wdata <= {24'd0, x_i[1] ? (x_i[0] ? st_data[31:24] : st_data[23:16])
+                                                  : (x_i[0] ? st_data[15:8] : st_data[7:0])};
+                        dreq_r <= 1'b1;  dwr_r <= 1'b1;
+                        x_off <= x_off + 13'd1;
+                        x_i   <= x_i + 3'd1;
+                        if (x_i + 3'd1 == x_bytes) xs <= X_RDY;
+                    end
+                end else begin
+                    d_addr <= x_pa;  d_size <= 2'd0;  d_io <= 1'b0;
+                    dreq_r <= 1'b1;  dwr_r <= 1'b0;
+                    xs <= X_BW;
+                end
+                X_BW: if (d_ack) begin
+                    case (x_i[1:0])
+                        2'd0: x_rd[7:0]   <= d_rdata[7:0];
+                        2'd1: x_rd[15:8]  <= d_rdata[7:0];
+                        2'd2: x_rd[23:16] <= d_rdata[7:0];
+                        default: x_rd[31:24] <= d_rdata[7:0];
+                    endcase
+                    x_off <= x_off + 13'd1;
+                    x_i   <= x_i + 3'd1;
+                    xs <= (x_i + 3'd1 != x_bytes) ? X_BI : (x_io != 2'd0) ? X_IOC : X_RDY;
+                end else
+                    dreq_r <= 1'b1;
+                // The permission map: a word of the TSS is read ...
+                X_IOA: if (x_io == 2'd3) begin
+                    x_cur <= x_lin[31:12];
+                    x_io  <= 2'd2;
+                    xs <= X_LOOK;
+                end else begin
+                    d_addr <= {x_ppn, x_lin[11:0]};  d_size <= 2'd1;  d_io <= 1'b0;
+                    dreq_r <= 1'b1;  dwr_r <= 1'b0;
+                    xs <= X_IOB;
+                end
+                X_IOB: if (d_ack) begin
+                    x_rd[15:0] <= d_rdata[15:0];
+                    xs <= X_IOC;
+                end else
+                    dreq_r <= 1'b1;
+                // ... first the one that says where the map is, then
+                // the map's bits for the port (off: the port's number).
+                X_IOC: if (x_io == 2'd1) begin
+                    if ({4'd0, x_rd[15:0]} + {7'd0, io_last[15:3]} > tr_lim) begin
+                        ud_now <= 1'b1;
+                        ud_vec <= 8'd13;
+                        xs <= X_IDLE;
+                    end else begin
+                        x_lin <= tr_base + {16'd0, x_rd[15:0]} + {19'd0, x_port[15:3]};
+                        x_second <= 1'b0;
+                        x_io <= 2'd3;
+                        xs <= X_IOA;
+                    end
+                end else begin
+                    x_io <= 2'd0;
+                    if (((x_rd[15:0] >> x_port[2:0]) & {12'd0, io_mask}) != 16'd0) begin
+                        ud_now <= 1'b1;
+                        ud_vec <= 8'd13;
+                        xs <= X_IDLE;
+                    end else
+                        xs <= X_RDY;
+                end
+                // Ready: the uop takes it from here (the decoder takes
+                // its own, in DS_XL).
+                X_RDY: if (!x_dec && valid && !stall && is_mem && !cyc2)
+                    xs <= X_IDLE;
+                default: xs <= X_IDLE;
+            endcase
+            if (flt_now) xs <= X_IDLE;
+            // The mapping changed: the buffer is emptied, and the
+            // instruction cache with it (its entries are found by
+            // linear address).
+            if (x_flush) begin
+                tlb_v <= 32'd0;
+                if (gen == {GW{1'b1}}) begin
+                    gen <= {GW{1'b0}} + 1'b1;
+                    flushing <= 1'b1;
+                    fl_idx <= {DC_AW{1'b0}};
+                end else
+                    gen <= gen + 1'b1;
+            end
         end
     end
+
+    // A page fault: CR2 is the address, the error code says what was
+    // being done (bit 0 the page was present, 1 a write, 2 at level 3).
+    task page_fault(input present, input write);
+        begin
+            cr2 <= {x_cur, x_second ? 12'd0 : x_lin[11:0]};
+            err <= {13'd0, x_user, write, present};
+            ud_now  <= 1'b1;
+            ud_vec  <= 8'd14;
+            ud_keep <= 1'b1;
+            xf_now  <= !un_new;
+            xs <= X_IDLE;
+            ds <= DS_IDLE;
+        end
+    endtask
 
 endmodule
 

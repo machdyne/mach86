@@ -16,7 +16,7 @@ module m86_audio_tb;
     wire tick, frame_req, sd_l, sd_r;
     wire signed [15:0] sample;
     m86_audio #(.OPLROM("../output/opl/opl_rom.hex")) dut (
-        .clk(clk), .opl_we(we), .opl_a(wa), .opl_d(wd), .spk(spk),
+        .clk(clk), .opl_we(we), .opl_a(wa), .opl_d(wd), .spk(spk), .sb(8'h80),
         .aclk(clk), .arst(rst), .tick(tick), .frame_req(frame_req),
         .sample(sample), .sd_l(sd_l), .sd_r(sd_r));
 

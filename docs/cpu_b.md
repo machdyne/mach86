@@ -8,11 +8,14 @@ design, what exists of it, and what has been measured.
 DOOM under DOS/4GW among them, at 33 MHz and 21.4 million
 instructions a second on plain code, measured there (1.4 to 1.6 cycles an
 instruction; DOS itself, with its calls and console output, is
-nearer 2.6). It passes 1,748,646 instruction vectors captured from
-a real 386 with 53 known deviations, and runs DOS and DOOM's start
-in lockstep with the reference model without a difference. It is a
+nearer 2.6). It passes 1,758,646 instruction vectors captured from
+a real 386 with 53 known deviations, and runs DOS and DOOM into its
+demo (194 million instructions) in lockstep with the reference model
+without a difference. It is a
 486SX to software: the 486's instructions and AC flag, no FPU, no
-`CPUID`. Protected mode is partial ([pmode.md](pmode.md)).
+`CPUID`. Protected mode is a 386's but for task switches: privilege
+levels (round 28), paging and virtual 8086 mode (round 29), in
+simulation so far ([pmode.md](pmode.md)).
 
 The sections below were written as the design grew, and the older
 ones give the figures of their time; [round 26](#round-26) has the
@@ -457,8 +460,9 @@ unconnected). Both are fixed; the hardware was never wrong.
 
 - The shifter gives "the other half" of a shift (the bits that
   leave the operand), which is what the second operand of a double
-  shift contributes. A double shift is two shifts and an OR, about
-  twelve cycles. With 16-bit operands and more than 16 places the
+  shift contributes. A double shift was two shifts and an OR, about
+  twelve cycles of shifting in a routine of twenty (one uop since
+  [round 27](#round-27)). With 16-bit operands and more than 16 places the
   hardware's result is the source rotated, and so is ours.
 - The ALU has three bit operations; a bit instruction on a register
   is one cycle. With a register for the bit number and memory for
@@ -487,11 +491,115 @@ block RAM.
 The vectors: 1,748,646 pass, none fail, 53 known deviations (the
 model's 29 and the 24 above).
 
+### Round 27
+
+**The microcode ROM is 2,048 words.** Opcodes still start in the
+lower 1,024 (the attribute ROM's entry field is ten bits); routines
+that are only jumped to can go in the upper half, and the
+microassembler has `upper()` and `lower()` for that. 895 words are
+used below and 78 above. A jump target is eleven bits now (the
+eleventh is ROM bit 85, which was free), and so is a constant. The
+cache entry is still 189 bits: one of the bits decoded ahead ("with
+carry", which is in no hurry) was given up for the continuation
+address's eleventh.
+
+**Block RAM** was paid for on Lakritz, which had none left
+([boards.md](boards.md#lakritz-where-it-stands)): the ROM's five more
+blocks came from the data cache's dirty bits, the coarse code map
+(now a mark for each 32 KB, in LUT RAM), the AdLib's table ROM and
+the two USB hosts' ROMs, all moved into logic. That costs about
+2,800 LUTs there.
+
+**SHLD and SHRD are one uop,** three cycles like any shift, where
+round 26's were a routine of about twenty: a second multiplier
+beside the shifter's makes the bits the second operand gives. DOOM
+draws its floors with `SHLD`; on the model's count 2.8% of all the
+instructions DOOM runs are double shifts, so this is worth roughly
+a sixth of its time. How much faster DOOM is on a board has not
+been measured.
+
+### Round 28
+
+**Privilege levels** ([pmode.md](pmode.md#privilege-levels)). The
+core gained the current level, the checks on segment loads and far
+transfers, error codes, stack switches through the task state
+segment, call gates, `ARPL`, and the rights of each loaded segment.
+The rules are one block of logic that the microcode consults; the
+sequencing is microcode, 322 words more in the ROM's upper half
+(899 below, 400 above, of 2,048). On the cached path the only
+addition is the rights check on a memory access, which is folded
+into the value the limit check already registers, so no path grew.
+
+**A store that faults.** An instruction that ends with a store is
+finished a cycle before the store is known to be allowed; if it is
+not, the fault follows at once and is delivered with the
+instruction's own address. The lockstep bench did not know this (no
+earlier test ended an instruction on a faulting store) and now waits
+for the fault's delivery before it compares.
+
+### Round 29
+
+**Paging, virtual 8086 mode and the I/O permission bitmap**
+([pmode.md](pmode.md#paging)). One new unit in the core, a state
+machine beside the execution path, does all three jobs that need
+memory looked at before an access may go ahead: it translates the
+address (a 32-entry buffer in LUT RAM, and the page walk when the
+page is not in it), makes an access that lies across two pages a
+byte at a time, and reads the task state segment's bitmap for a
+port. A micro-operation that needs it is held, exactly as a store
+is held when the memory is not ready for it, until the unit says
+"ready" or raises the fault; the decoder's fetches wait for it the
+same way. Because the operation has not begun, nothing has to be
+undone and the microcode knows nothing of it: a page fault is an
+ordinary fault raised before the access.
+
+What the rest of the core gave up for it: with paging on, loads no
+longer announce their address to the data cache a cycle early, and
+the code map is kept by physical address (so a store through
+another mapping of a code page still finds the cached instruction;
+the search then ignores the entry's tag above the page offset and
+may throw out a few entries too many).
+
+An access across two pages is read by the unit into a register,
+and the micro-operation then reads that register as if it were I/O
+port 1E8h, which the machine around the core answers from the
+core's own output. That keeps a multiplexer out of the path from
+the data cache to the ALU, which is the longest in the design.
+
+**Virtual 8086 mode** is mostly microcode: `IRET` into it, the
+interrupt out of it, and a word each in `PUSHF`, `POPF`, `INT n`
+and `IRET` to ask whether they fault. In the core it is one flag
+that makes segment loads real mode's.
+
+**The code map's marks are registered** a cycle after the cache
+entry is written. The comparison that decides whether an
+instruction spans two blocks had been the end of the longest path
+since paging put a multiplexer in front of it.
+
+**Found by the test suite** (verification.md), in the core as it was before:
+`POPAD` on a 32-bit stack changed the upper half of ESP; `BOUND`
+did not exist; call gates did not copy parameters. All three are
+fixed, and 10,000 more of the instruction vectors pass (`BOUND`'s).
+
+The microcode is 918 words below and about 480 above, of 2,048.
+
+### Round 30
+
+**A byte for someone else.** The Sound Blaster's samples are fetched
+by the core ([sound.md](sound.md#the-sound-blaster)): `dma_req`
+holds the next instruction back for the three or four cycles of one
+byte read, the way the speed control's wait does, and the paging
+unit's state machine makes the read. The first version let the
+instruction cache's read port wander during the wait, and the
+instruction after ran with another's operands; the lockstep bench
+now has a request generator (`M86B_DMA=n`) that found it at once
+and guards it.
+
 ## Known limits
 
-1. **Microcode ROM space.** 1,019 of 1,024 words are used. Anything
-   more needs the ROM to grow to 2,048 words, which costs five block
-   RAMs and a wider jump field; Lakritz has none to spare.
+1. **Block RAM on Lakritz.** All 56 blocks are used. The microcode
+   ROM has room (1,397 of 2,048 words used), but anything else that
+   wants a block has to take it from something.
 2. **Self-modifying code** is handled exactly, but two windows
    remain. A store takes effect on the cache at the end of the
    instruction that makes it, so an instruction that overwrites the
@@ -508,3 +616,14 @@ model's 29 and the 24 above).
    differently by Verilator and by Icarus. Both stay in `make check`
    for that reason.
 6. No NMI and no single-step trap.
+7. **Paging is slow** ([pmode.md](pmode.md#paging)): two or three
+   cycles more for every memory access, and the instruction cache
+   emptied whenever the mapping changes. Plain DOS pays nothing.
+8. **Port 1E8h belongs to the core** when paging is on: whatever
+   holds the core must answer a read of it with the core's `x_rd`
+   output and ignore writes (`rtl/soc/m86_soc.v` and the lockstep
+   bench do).
+9. **A fault in the middle of a stack switch** (the new stack's page
+   not present, say) is delivered with the new stack segment already
+   loaded. Systems keep their level-0 stacks present, so this should
+   not arise; it is not what a 386 does.

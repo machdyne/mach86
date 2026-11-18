@@ -55,12 +55,14 @@ typedef struct {
 typedef struct pc {
     m86      cpu;
     uint8_t *ram;
-    uint8_t  rom[0x10000];      /* F0000h-FFFFFh */
+    uint8_t  rom[0x20000];              /* the BIOS, ending at FFFFFh */
+    uint32_t rom_size;                  /* 64 KB; a test ROM may be 128 KB (model only) */
     int      a20;
 
     pc_pic   pic[2];
     pc_pit_ch pit[3];
     uint8_t hdmi;                       /* port 1E1h bit 0 */
+    uint8_t post;                       /* the last code written to port 190h */
     uint8_t slow;                       /* the speed control's register (port 1E0h) */
     /* The mouse port (E3h, interrupt 12). */
     struct {
@@ -74,6 +76,22 @@ typedef struct pc {
         uint32_t frac;                  /* timer ticks * 1000, towards 80 us */
         uint32_t writes;                /* register writes seen */
     } opl;
+    /* The Sound Blaster (a 2.0: DSP at 220h, 8-bit DMA on channel 1,
+     * interrupt 7) and the one DMA channel it uses. */
+    struct {
+        uint8_t  rst, cmd, need, have, arg[2];
+        uint8_t  out[4], out_n, last;
+        uint8_t  tc, speaker, active, autoinit, paused, irq, dac, test;
+        uint16_t block;
+        uint32_t left;
+        uint64_t frac;                  /* timer ticks * 1,000,000 towards a sample */
+        uint32_t samples;               /* played, for the tests */
+        void    *wav;                   /* M86_WAV: what was played, as a file */
+    } sb;
+    struct {
+        uint16_t addr, count, base_addr, base_count;
+        uint8_t  page, mode, mask, ff, tc;
+    } dma;
     uint32_t pit_frac;          /* instructions not yet turned into ticks */
     uint32_t insn_per_tick;
 

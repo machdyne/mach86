@@ -37,6 +37,8 @@ help:
 	@echo "  make soc-dos      DOS on the simulated SoC"
 	@echo "  make check-gate   the BIOS boot test on the SoC after synthesis"
 	@echo "  make check-486    double shifts, bit instructions, 486 instructions (model, lockstep)"
+	@echo "  make check-pg     paging: page faults, pages apart, accessed and dirty bits (model, lockstep, SoC)"
+	@echo "  make check-pm3    protected mode: privilege levels, stack switches, call gates (model, lockstep, SoC)"
 	@echo "  make check-pm2    protected mode: 32-bit segments, gates, faults (model, lockstep, SoC)"
 	@echo "  make gate-dos     DOS on the SoC after synthesis (slow)"
 	@echo "  make lakritz      a bitstream for Lakritz (not run on a board)"
@@ -47,7 +49,7 @@ help:
 	@echo "  make synth-b      synthesise, place and route CPU design B"
 	@echo "                    for Lakritz's FPGA; report size and clock"
 
-check: check-docs check-sim check-rtl check-b check-b-boot check-tb check-soc check-486 check-pm check-pm2 check-pm check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse check-soc-train
+check: check-docs check-sim check-rtl check-b check-b-boot check-tb check-soc check-486 check-pm check-pm2 check-pm3 check-pg check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse check-soc-train
 
 check-docs:
 	python3 tools/checkdocs.py
@@ -152,6 +154,12 @@ check-486:
 check-pm2:
 	$(MAKE) -C sim check-pm2
 
+check-pm3:
+	$(MAKE) -C sim check-pm3
+
+check-pg:
+	$(MAKE) -C sim check-pg
+
 check-spk:
 	$(MAKE) -C sim check-spk
 
@@ -207,11 +215,19 @@ RTL_BOARD = rtl/cpu/m86_alu.v rtl/cpu/m86b_core.v $(wildcard rtl/soc/*.v) \
 # run), so the rule below tries twice.
 # The placement seed: of four tried in round 19 (31.2 to 32.9 MHz for
 # 31.5; one fails) this was the best.
-BOARD_SEED ?= 3
+BOARD_SEED ?= 1
+# The placer is told to weigh timing three times as heavily as it does by
+# itself: on the Sergei that is worth about 1 MHz of the CPU clock.
+PNR_OPT ?= --placer-heap-timingweight 30
+
+# The USB host's little ROM (third-party, not edited) is kept out of
+# block RAM, which Lakritz has none to spare of: about 330 LUTs a port.
+USB_ROM_IN_LOGIC = setattr -set rom_style \"logic\" usb_hid_host_rom/m:mem;
 
 define SYNTH_BOARD
 yosys -q -l syn.log -p "read_verilog -DOSC48 \
   $(addprefix ../../,$(RTL_BOARD)) ../../rtl/boards/sergei_ml2.v; \
+  $(USB_ROM_IN_LOGIC) \
   hierarchy -top sergei_ml2; write_rtlil elab.il; design -reset; \
   read_rtlil elab.il; \
   synth_ecp5 -top sergei_ml2 -abc9 -nowidelut -json mach86.json; stat"
@@ -227,6 +243,7 @@ LAK_SEED ?= 3
 define SYNTH_LAK
 yosys -q -l syn.log -p "read_verilog \
   $(addprefix ../../,$(RTL_LAK)) ../../rtl/boards/lakritz.v; \
+  $(USB_ROM_IN_LOGIC) \
   synth_ecp5 -top lakritz -abc9 -nowidelut -json mach86.json; stat"
 endef
 
@@ -240,7 +257,7 @@ lakritz:
 	cp rtl/ext/usb_hid_host/usb_hid_host_rom.hex $(LAK_OUT)/
 	cd $(LAK_OUT) && { $(SYNTH_LAK) || { echo "yosys failed: once more"; $(SYNTH_LAK); }; }
 	@grep -E "LUT4|TRELLIS_FF|DP16KD|MULT18X18D|TRELLIS_DPR16X4" $(LAK_OUT)/syn.log | tail -n 5
-	cd $(LAK_OUT) && nextpnr-ecp5 --25k --package CABGA256 --speed 6 \
+	cd $(LAK_OUT) && nextpnr-ecp5 --25k --package CABGA256 --speed 6 $(PNR_OPT) \
 	  --lpf ../../boards/lakritz.lpf --json mach86.json \
 	  --textcfg mach86.config --seed $(LAK_SEED) > pnr.log 2>&1
 	@grep -E "TRELLIS_COMB|DP16KD:" $(LAK_OUT)/pnr.log | tail -n 2
@@ -258,7 +275,7 @@ sergei_ml2:
 	cp rtl/ext/usb_hid_host/usb_hid_host_rom.hex $(BOARD_OUT)/
 	cd $(BOARD_OUT) && { $(SYNTH_BOARD) || { echo "yosys failed: once more"; $(SYNTH_BOARD); }; }
 	@grep -E "LUT4|TRELLIS_FF|DP16KD|MULT18X18D|TRELLIS_DPR16X4" $(BOARD_OUT)/syn.log | tail -n 5
-	cd $(BOARD_OUT) && nextpnr-ecp5 --45k --package CABGA256 --speed 6 \
+	cd $(BOARD_OUT) && nextpnr-ecp5 --45k --package CABGA256 --speed 6 $(PNR_OPT) \
 	  --lpf ../../boards/sergei_ml2.lpf --json mach86.json \
 	  --textcfg mach86.config --seed $(BOARD_SEED) > pnr.log 2>&1
 	@grep -E "TRELLIS_COMB|DP16KD:" $(BOARD_OUT)/pnr.log | tail -n 2
@@ -284,11 +301,11 @@ $(1):
 	cp rtl/ext/usb_hid_host/usb_hid_host_rom.hex output/$(1)/
 	cd output/$(1) && yosys -q -l syn.log -p "read_verilog -DM86_TOP=$(1) $(5) \
 	  $(if $(filter ddr3,$(2)),-DOSC48 $$(addprefix ../../,$$(RTL_BOARD)) ../../rtl/boards/sergei_ml2.v; \
-	    hierarchy -top $(1); write_rtlil elab.il; design -reset; read_rtlil elab.il,\
-	    $$(addprefix ../../,$$(RTL_LAK)) ../../rtl/boards/lakritz.v); \
+	    $$(USB_ROM_IN_LOGIC) hierarchy -top $(1); write_rtlil elab.il; design -reset; read_rtlil elab.il,\
+	    $$(addprefix ../../,$$(RTL_LAK)) ../../rtl/boards/lakritz.v; $$(USB_ROM_IN_LOGIC)); \
 	  synth_ecp5 -top $(1) -abc9 -nowidelut -json mach86.json; stat"
 	@grep -E "LUT4|TRELLIS_FF|DP16KD|MULT18X18D|TRELLIS_DPR16X4" output/$(1)/syn.log | tail -n 5
-	cd output/$(1) && nextpnr-ecp5 $(3) --package CABGA256 --speed 6 \
+	cd output/$(1) && nextpnr-ecp5 $(3) --package CABGA256 --speed 6 $(PNR_OPT) \
 	  --lpf ../../boards/$(4) --json mach86.json \
 	  --textcfg mach86.config --seed $$(SEED) > pnr.log 2>&1
 	@grep -E "TRELLIS_COMB|DP16KD:" output/$(1)/pnr.log | tail -n 2

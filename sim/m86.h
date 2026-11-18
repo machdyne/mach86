@@ -30,6 +30,8 @@ enum { M86_ES, M86_CS, M86_SS, M86_DS, M86_FS, M86_GS };
 #define M86_IF 0x0200u
 #define M86_DF 0x0400u
 #define M86_OF 0x0800u
+#define M86_NT 0x4000u
+#define M86_VM 0x20000u
 
 /* Instruction classes, for the profile (docs/model.md). */
 enum {
@@ -51,6 +53,14 @@ typedef struct {
     uint32_t base;
     uint32_t limit;
     uint8_t  d;         /* the descriptor's D/B bit: 32-bit code, 32-bit stack */
+    /* Rights from the descriptor, looked at in protected mode only.
+     * All zero means anything goes, which is what real mode loads. */
+    uint8_t  nw;        /* not writable */
+    uint8_t  nr;        /* not readable (execute-only code) */
+    uint8_t  ed;        /* expand-down data: valid offsets lie above the limit */
+    uint8_t  cc;        /* conforming code */
+    uint8_t  dpl;       /* the descriptor's privilege level */
+    uint8_t  null;      /* loaded with a null selector: unusable */
 } m86_seg;
 
 typedef struct {
@@ -58,6 +68,7 @@ typedef struct {
     uint32_t eip;
     uint32_t eflags;
     m86_seg  seg[6];
+    uint8_t  cpl;       /* current privilege level, 0 to 3 */
 } m86_regs;
 
 typedef struct m86 m86;
@@ -68,8 +79,8 @@ struct m86 {
     uint32_t cr0, cr2, cr3;
     uint32_t dr[8];
     struct { uint32_t base; uint16_t limit; } gdtr, idtr;
-    struct { uint16_t sel; uint32_t base; uint16_t limit; } ldtr, tr;
-    int fault_ec;       /* the interrupt being delivered is a fault (it may push an error code) */
+    struct { uint16_t sel; uint32_t base; uint32_t limit; uint8_t t32; } ldtr, tr;   /* t32: a 386 task state segment */
+    uint32_t err;       /* the error code of the fault being raised */
 
     int halted;         /* HLT executed; an interrupt wakes it */
     int shutdown;       /* fault while delivering a fault: the CPU has stopped */

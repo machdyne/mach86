@@ -105,6 +105,7 @@ module m86_soc #(
     input  wire [31:0] lb_q,
     output wire hdmi,               // port 1E1h bit 0: sound on the display's cable, please
     output wire spk,                // the PC speaker: timer channel 2 and port 61h bit 1
+    output wire [7:0] sb_sample,    // what the Sound Blaster is playing (unsigned), for m86_audio
     output wire       opl_we,       // the AdLib's register writes, for m86_opl2
     output wire [7:0] opl_a,
     output wire [7:0] opl_d,
@@ -153,6 +154,10 @@ module m86_soc #(
 
     // ---- the CPU ----
     wire        d_req, d_wr, d_io;
+    wire [31:0] x_rd;
+    wire        dma_req, dma_ack;
+    wire [23:0] dma_addr;
+    wire [7:0]  dma_q;
     wire [31:0] d_addr, d_wdata;
     wire [1:0]  d_size;
     reg  [31:0] d_rdata;
@@ -175,7 +180,8 @@ module m86_soc #(
         .d_req(d_req), .d_wr(d_wr), .d_addr(d_addr), .d_size(d_size),
         .d_wdata(d_wdata), .d_rdata(d_rdata), .d_ack(d_ack_cpu), .d_st_rdy(d_st_rdy),
         .e_req(e_req), .e_addr(e_addr), .e_size(e_size),
-        .d_io(d_io),
+        .d_io(d_io), .x_rd(x_rd),
+        .dma_req(dma_req), .dma_addr(dma_addr), .dma_ack(dma_ack), .dma_q(dma_q),
         .slow(slow), .irq(irq), .irq_vec(irq_vec), .inta(inta),
         .halted(halted), .step_done(), .last_exc(last_exc), .dbg_insns());
 
@@ -297,10 +303,28 @@ module m86_soc #(
     wire cs_e8    = (port == 16'h00E8);
     wire cs_ec    = (port == 16'h00EC);
     wire cs_vga   = (port[15:5] == 11'h01E);        // 3C0h-3DFh
-    wire cs_opl   = (port[15:1] == 15'h01C4);       // 388h, 389h
+    wire cs_opl   = (port[15:1] == 15'h01C4) ||     // 388h, 389h
+                    (port[15:1] == 15'h0114);       // ... and 228h, 229h, on the Sound Blaster
     wire cs_e3    = (port == 16'h00E3);
     wire cs_slow  = (port == 16'h01E0);
     wire cs_hdmi  = (port == 16'h01E1);
+    wire cs_xrd   = (port == 16'h01E8);
+    wire cs_sb    = (port[15:4] == 12'h022);        // 220h-22Fh
+    wire cs_dma   = (port[15:4] == 12'h000);        // 00h-0Fh
+    wire cs_dmap  = (port == 16'h0083);
+
+    // The Sound Blaster, and the DMA channel it plays through.
+    wire [7:0] sb_q;
+    wire       sb_irq;              // up until the DSP's status is read
+    reg        sb_irq_d;
+    always @(posedge clk) sb_irq_d <= sb_irq;
+    wire       irq7 = sb_irq && !sb_irq_d;      // (the interrupt controller wants a pulse)
+    m86_sb #(.CLK_HZ(CLK_HZ)) sb (
+        .clk(clk), .rst(sys_rst),
+        .cs_dsp(cs_sb), .cs_dma(cs_dma), .cs_page(cs_dmap), .a(port[3:0]),
+        .rd(io_rd), .wr(io_wr), .wd(io_wd), .q(sb_q), .irq(sb_irq),
+        .dma_req(dma_req), .dma_addr(dma_addr), .dma_ack(dma_ack), .dma_q(dma_q),
+        .sample(sb_sample));
 
     // Interrupt controllers.
     wire [7:0] pic_q;
@@ -308,7 +332,7 @@ module m86_soc #(
     m86_pic pic (
         .clk(clk), .rst(sys_rst), .cs_m(cs_pic_m), .cs_s(cs_pic_s), .a0(port[0]),
         .wr(io_wr), .wdata(io_wd), .rdata(pic_q),
-        .req({3'd0, irq12, 10'd0, irq1, irq0}), .irq(irq), .inta(inta), .vec(irq_vec));
+        .req({3'd0, irq12, 4'd0, irq7, 5'd0, irq1, irq0}), .irq(irq), .inta(inta), .vec(irq_vec));
 
     // Timer: 1,193,182 ticks a second, made from the system clock.
     reg [31:0] pit_acc;
@@ -460,7 +484,8 @@ module m86_soc #(
 
     reg [31:0] io_q;
     always @(posedge clk)
-        io_q <= cs_e8 ? mp_addr :
+        io_q <= cs_xrd ? x_rd :           // (what the paging unit read: m86b_core.v)
+                cs_e8 ? mp_addr :
                 cs_ec ? mp_data :
                 {24'hFFFFFF,
                 (cs_pic_m || cs_pic_s) ? pic_q :
@@ -473,6 +498,7 @@ module m86_soc #(
                 (cs_e1 || cs_e2) ? spi_q :
                 cs_vga ? vga_q :
                 cs_opl ? opl_status :
+                (cs_sb || cs_dma || cs_dmap) ? sb_q :
                 cs_e3 ? mouse_q :
                 cs_slow ? slow :
                 cs_hdmi ? {7'd0, hdmi_r} :

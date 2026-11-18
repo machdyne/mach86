@@ -19,7 +19,8 @@
 #define EFLAGS_MASK 0x00077FD5u     /* with AC, bit 18: a 486's */
 
 enum { EXC_DE = 0, EXC_DB = 1, EXC_BP = 3, EXC_OF = 4, EXC_BR = 5,
-       EXC_UD = 6, EXC_NM = 7, EXC_DF = 8, EXC_SS = 12, EXC_GP = 13 };
+       EXC_UD = 6, EXC_NM = 7, EXC_DF = 8, EXC_TS = 10, EXC_NP = 11,
+       EXC_SS = 12, EXC_GP = 13, EXC_PF = 14 };
 
 const char *const m86_class_name[M86_CL_COUNT] = {
     "register to register", "load", "arithmetic with memory source",
@@ -35,44 +36,119 @@ const double m86_class_cycles[M86_CL_COUNT] = {
 
 /* ---- faults ---------------------------------------------------- */
 
+static void fault_e(m86 *c, int vec, uint32_t err)
+{
+    c->err = err;
+    longjmp(c->fault_jmp, vec + 1);
+}
+
 static void fault(m86 *c, int vec)
 {
-    longjmp(c->fault_jmp, vec + 1);
+    fault_e(c, vec, 0);
 }
 
 /* ---- memory ---------------------------------------------------- */
 
-static uint32_t linear(m86 *c, int seg, uint32_t off, int size)
+#define PMODE_CHECKS ((c->cr0 & 1) && !(c->s.eflags & M86_VM))
+
+/* A linear address through the page tables. `user` is an access made
+ * at level 3; the tables of the processor itself are read as level 0.
+ * A level-0 write ignores read-only pages unless CR0.WP is set. */
+static uint32_t translate(m86 *c, uint32_t la, int write, int user)
 {
-    const m86_seg *s = &c->s.seg[seg];
-    uint32_t last = off + (uint32_t)size - 1;
-    if (off > s->limit || last > s->limit || last < off)
-        fault(c, seg == M86_SS ? EXC_SS : EXC_GP);
-    return s->base + off;
+    uint32_t pa = (c->cr3 & 0xFFFFF000u) + ((la >> 22) << 2);
+    uint32_t pde = 0, pte = 0, ta = 0;
+    int present = 0;
+    for (int i = 0; i < 4; i++)
+        pde |= (uint32_t)c->mem_read(c->bus, pa + i) << (8 * i);
+    if (pde & 1) {
+        ta = (pde & 0xFFFFF000u) + (((la >> 12) & 0x3FF) << 2);
+        for (int i = 0; i < 4; i++)
+            pte |= (uint32_t)c->mem_read(c->bus, ta + i) << (8 * i);
+        present = pte & 1;
+    }
+    uint32_t both = pde & pte;
+    if (!present || (user && !(both & 4)) ||
+        (write && !(both & 2) && (user || (c->cr0 & 0x10000u)))) {
+        c->cr2 = la;
+        fault_e(c, EXC_PF, (uint32_t)(present | (write << 1) | (user << 2)));
+    }
+    if (!(pde & 0x20))
+        c->mem_write(c->bus, pa, (uint8_t)(pde | 0x20));
+    if ((pte & 0x20) == 0 || (write && !(pte & 0x40)))
+        c->mem_write(c->bus, ta, (uint8_t)(pte | 0x20 | (write ? 0x40 : 0)));
+    return (pte & 0xFFFFF000u) | (la & 0xFFF);
 }
 
-static uint32_t phys_rd(m86 *c, uint32_t a, int size)
+static uint32_t lin_rd(m86 *c, uint32_t a, int size, int user)
 {
     uint32_t v = 0;
+    if (c->cr0 & 0x80000000u) {
+        if ((a & 0xFFF) + (uint32_t)size <= 0x1000) {
+            a = translate(c, a, 0, user);
+        } else {
+            for (int i = 0; i < size; i++)
+                v |= (uint32_t)c->mem_read(c->bus, translate(c, a + i, 0, user)) << (8 * i);
+            return v;
+        }
+    }
     for (int i = 0; i < size; i++)
         v |= (uint32_t)c->mem_read(c->bus, a + i) << (8 * i);
     return v;
 }
 
-static void phys_wr(m86 *c, uint32_t a, int size, uint32_t v)
+static void lin_wr(m86 *c, uint32_t a, int size, uint32_t v, int user)
 {
+    if (c->cr0 & 0x80000000u) {
+        if ((a & 0xFFF) + (uint32_t)size <= 0x1000) {
+            a = translate(c, a, 1, user);
+        } else {
+            /* Both pages are checked before either is written. */
+            translate(c, a, 1, user);
+            translate(c, a + (uint32_t)size - 1, 1, user);
+            for (int i = 0; i < size; i++)
+                c->mem_write(c->bus, translate(c, a + i, 1, user), (uint8_t)(v >> (8 * i)));
+            return;
+        }
+    }
     for (int i = 0; i < size; i++)
         c->mem_write(c->bus, a + i, (uint8_t)(v >> (8 * i)));
 }
 
+/* The processor's own reads and writes: descriptor tables, the TSS. */
+#define phys_rd(c, a, n)    lin_rd(c, a, n, 0)
+#define phys_wr(c, a, n, v) lin_wr(c, a, n, v, 0)
+
+/* Segment and offset to a linear address, with the checks. how: 0
+ * read, 1 write, 2 fetch. */
+static uint32_t linear(m86 *c, int seg, uint32_t off, int size, int how)
+{
+    const m86_seg *s = &c->s.seg[seg];
+    uint32_t last = off + (uint32_t)size - 1;
+    int vec = seg == M86_SS ? EXC_SS : EXC_GP;
+    if (PMODE_CHECKS) {
+        if (s->null || (how == 1 && s->nw) || (how == 0 && s->nr))
+            fault_e(c, EXC_GP, 0);
+        if (s->ed) {
+            uint32_t top = s->d ? 0xFFFFFFFFu : 0xFFFFu;
+            if (off <= s->limit || last > top || last < off)
+                fault_e(c, vec, 0);
+            return s->base + off;
+        }
+    }
+    if (off > s->limit || last > s->limit || last < off)
+        fault_e(c, vec, 0);
+    return s->base + off;
+}
+
 static uint32_t rd_mem(m86 *c, int seg, uint32_t off, int size)
 {
-    return phys_rd(c, linear(c, seg, off, size), size);
+    return lin_rd(c, linear(c, seg, off, size, 0), size, c->s.cpl == 3);
 }
 
 static void wr_mem(m86 *c, int seg, uint32_t off, int size, uint32_t v)
 {
-    phys_wr(c, linear(c, seg, off, size), size, v);
+    lin_wr(c, linear(c, seg, off, size, 1), size, v, c->s.cpl == 3);
 }
 
 /* ---- instruction fetch ----------------------------------------- */
@@ -81,7 +157,7 @@ static uint8_t fetch8(m86 *c)
 {
     if (++c->len > 15)
         fault(c, EXC_GP);
-    uint8_t v = (uint8_t)rd_mem(c, M86_CS, c->s.eip, 1);
+    uint8_t v = (uint8_t)lin_rd(c, linear(c, M86_CS, c->s.eip, 1, 2), 1, c->s.cpl == 3);
     c->s.eip++;
     return v;
 }
@@ -125,33 +201,11 @@ static void wr_reg(m86 *c, int size, int i, uint32_t v)
 
 void m86_set_seg_real(m86 *c, int seg, uint16_t sel)
 {
-    c->s.seg[seg].sel = sel;
-    c->s.seg[seg].base = (uint32_t)sel << 4;
-}
-
-static uint32_t phys_rd(m86 *c, uint32_t a, int size);
-
-/* A segment register is loaded. In real mode the base is the selector
- * times 16 and the limit stays what it was (which is what "unreal
- * mode" lives on). With CR0.PE set the base and limit come from the
- * descriptor in the GDT or the LDT, and the D/B bit with them. Nothing
- * is checked (docs/pmode.md): not the type, not presence, not
- * privilege, not the table's limit. */
-static void set_seg(m86 *c, int seg, uint16_t sel)
-{
-    if (!(c->cr0 & 1)) {
-        m86_set_seg_real(c, seg, sel);
-        return;
-    }
-    uint32_t a = ((sel & 4) ? c->ldtr.base : c->gdtr.base) + (sel & 0xFFF8u);
-    uint32_t lo = phys_rd(c, a, 4), hi = phys_rd(c, a + 4, 4);
-    uint32_t lim = (hi & 0x000F0000u) | (lo & 0xFFFFu);
-    if (hi & 0x00800000u)
-        lim = (lim << 12) | 0xFFFu;
-    c->s.seg[seg].sel = sel;
-    c->s.seg[seg].base = (hi & 0xFF000000u) | ((hi & 0xFFu) << 16) | (lo >> 16);
-    c->s.seg[seg].limit = lim;
-    c->s.seg[seg].d = (hi >> 22) & 1;
+    m86_seg *s = &c->s.seg[seg];
+    s->sel = sel;
+    s->base = (uint32_t)sel << 4;
+    s->nw = s->nr = s->ed = s->cc = s->null = 0;
+    s->dpl = (c->cr0 & 1) ? 3 : 0;
 }
 
 /* ---- ModRM ----------------------------------------------------- */
@@ -463,6 +517,293 @@ static int cond(m86 *c, int cc)
     return r ^ (cc & 1);
 }
 
+/* ---- protection ------------------------------------------------- */
+
+/* Protected mode proper: PE set and not in virtual 8086 mode. */
+#define PMODE   ((c->cr0 & 1) && !(FLAGS & M86_VM))
+#define IOPL    ((int)((FLAGS >> 12) & 3))
+#define SELX(s) ((uint32_t)(s) & 0xFFFCu)
+
+static uint32_t desc_addr(m86 *c, uint16_t sel)
+{
+    return ((sel & 4) ? c->ldtr.base : c->gdtr.base) + (sel & 0xFFF8u);
+}
+
+static uint32_t desc_base(uint32_t lo, uint32_t hi)
+{
+    return (hi & 0xFF000000u) | ((hi & 0xFFu) << 16) | (lo >> 16);
+}
+
+static uint32_t desc_limit(uint32_t lo, uint32_t hi)
+{
+    uint32_t lim = (hi & 0x000F0000u) | (lo & 0xFFFFu);
+    if (hi & 0x00800000u)
+        lim = (lim << 12) | 0xFFFu;
+    return lim;
+}
+
+/* The two halves of the descriptor a selector names; 0 if it names
+ * none (the null selector, or one outside its table). */
+static int descriptor(m86 *c, uint16_t sel, uint32_t *lo, uint32_t *hi)
+{
+    uint32_t lim = (sel & 4) ? c->ldtr.limit : c->gdtr.limit;
+    uint32_t a = desc_addr(c, sel);
+    if ((sel & 0xFFFCu) == 0 || (uint32_t)(sel | 7) > lim)
+        return 0;
+    *lo = phys_rd(c, a, 4);
+    *hi = phys_rd(c, a + 4, 4);
+    return 1;
+}
+
+static void mark_accessed(m86 *c, uint16_t sel, uint32_t hi)
+{
+    if (!(hi & 0x100))
+        phys_wr(c, desc_addr(c, sel) + 5, 1, (hi >> 8) | 1);
+}
+
+/* Fill a segment register's hidden part from a descriptor. */
+static void seg_cache(m86 *c, int seg, uint16_t sel, uint32_t lo, uint32_t hi)
+{
+    m86_seg *s = &c->s.seg[seg];
+    int code = (hi >> 11) & 1, bit9 = (hi >> 9) & 1, bit10 = (hi >> 10) & 1;
+    s->sel = sel;
+    s->base = desc_base(lo, hi);
+    s->limit = desc_limit(lo, hi);
+    s->d = (hi >> 22) & 1;
+    s->nw = code || !bit9;
+    s->nr = code && !bit9;
+    s->ed = !code && bit10;
+    s->cc = code && bit10;
+    s->dpl = (hi >> 13) & 3;
+    s->null = 0;
+}
+
+static void seg_v86(m86 *c, int seg, uint16_t sel)
+{
+    m86_seg *s = &c->s.seg[seg];
+    memset(s, 0, sizeof *s);
+    s->sel = sel;
+    s->base = (uint32_t)sel << 4;
+    s->limit = 0xFFFF;
+    s->dpl = 3;
+}
+
+/* A segment register other than CS is loaded. In real mode and in
+ * virtual 8086 mode the base is the selector times 16 and the limit
+ * stays what it was. In protected mode the descriptor is fetched and
+ * checked against the privilege rules, and base, limit and rights
+ * come from it. */
+static void set_seg(m86 *c, int seg, uint16_t sel)
+{
+    if (!PMODE) {
+        m86_set_seg_real(c, seg, sel);
+        return;
+    }
+    uint32_t lo, hi;
+    int cpl = c->s.cpl, rpl = sel & 3;
+    if ((sel & 0xFFFCu) == 0) {
+        if (seg == M86_SS)
+            fault_e(c, EXC_GP, 0);
+        c->s.seg[seg].sel = sel;
+        c->s.seg[seg].null = 1;
+        return;
+    }
+    if (!descriptor(c, sel, &lo, &hi))
+        fault_e(c, EXC_GP, SELX(sel));
+    int S = (hi >> 12) & 1, code = (hi >> 11) & 1, rw = (hi >> 9) & 1;
+    int conf = (hi >> 10) & 1, dpl = (hi >> 13) & 3, p = (hi >> 15) & 1;
+    if (seg == M86_SS) {
+        if (rpl != cpl || !S || code || !rw || dpl != cpl)
+            fault_e(c, EXC_GP, SELX(sel));
+        if (!p)
+            fault_e(c, EXC_SS, SELX(sel));
+    } else {
+        if (!S || (code && !rw))
+            fault_e(c, EXC_GP, SELX(sel));
+        if (!(code && conf) && (dpl < cpl || dpl < rpl))
+            fault_e(c, EXC_GP, SELX(sel));
+        if (!p)
+            fault_e(c, EXC_NP, SELX(sel));
+    }
+    mark_accessed(c, sel, hi);
+    seg_cache(c, seg, sel, lo, hi);
+}
+
+/* CS is loaded from a descriptor already checked. */
+static void load_cs(m86 *c, uint16_t sel, uint32_t lo, uint32_t hi, int cpl, uint32_t eip)
+{
+    if (eip > desc_limit(lo, hi))
+        fault_e(c, EXC_GP, 0);
+    mark_accessed(c, sel, hi);
+    seg_cache(c, M86_CS, (uint16_t)((sel & 0xFFFCu) | (unsigned)cpl), lo, hi);
+    c->s.cpl = (uint8_t)cpl;
+    c->s.eip = eip;
+}
+
+/* The stack an inner level starts on, from the task state segment. */
+static void tss_stack(m86 *c, int dpl, uint16_t *ss, uint32_t *esp)
+{
+    uint32_t a;
+    if (c->tr.t32) {
+        a = 4 + 8 * (uint32_t)dpl;
+        if (a + 5 > c->tr.limit)
+            fault_e(c, EXC_TS, SELX(c->tr.sel));
+        *esp = phys_rd(c, c->tr.base + a, 4);
+        *ss = (uint16_t)phys_rd(c, c->tr.base + a + 4, 2);
+    } else {
+        a = 2 + 4 * (uint32_t)dpl;
+        if (a + 3 > c->tr.limit)
+            fault_e(c, EXC_TS, SELX(c->tr.sel));
+        *esp = phys_rd(c, c->tr.base + a, 2);
+        *ss = (uint16_t)phys_rd(c, c->tr.base + a + 2, 2);
+    }
+}
+
+/* Check a selector as the stack segment of level `cpl`; `vec` is the
+ * fault a bad one raises (invalid TSS when it came from the TSS). */
+static void check_ss(m86 *c, uint16_t sel, int cpl, int vec, uint32_t *lo, uint32_t *hi)
+{
+    if ((sel & 0xFFFCu) == 0)
+        fault_e(c, vec, 0);
+    if (!descriptor(c, sel, lo, hi))
+        fault_e(c, vec, SELX(sel));
+    if ((sel & 3) != cpl || (int)((*hi >> 13) & 3) != cpl ||
+        !(*hi & 0x1000) || (*hi & 0x800) || !(*hi & 0x200))
+        fault_e(c, vec, SELX(sel));
+    if (!(*hi & 0x8000))
+        fault_e(c, EXC_SS, SELX(sel));
+}
+
+static void set_esp(m86 *c, uint32_t v)
+{
+    R(M86_ESP) = (R(M86_ESP) & ~SP_MASK) | (v & SP_MASK);
+}
+
+/* ---- task switches ---------------------------------------------- */
+
+enum { TS_JMP, TS_CALL, TS_IRET };
+
+static void task_switch(m86 *c, uint16_t sel, int kind)
+{
+    uint32_t lo, hi;
+    if ((sel & 4) || !descriptor(c, sel, &lo, &hi))
+        fault_e(c, kind == TS_IRET ? EXC_TS : EXC_GP, SELX(sel));
+    int type = (hi >> 8) & 0x1F;
+    int want_busy = kind == TS_IRET;
+    if ((type & ~8) != (want_busy ? 3 : 1))
+        fault_e(c, kind == TS_IRET ? EXC_TS : EXC_GP, SELX(sel));
+    if (!(hi & 0x8000))
+        fault_e(c, EXC_NP, SELX(sel));
+    int n32 = (type >> 3) & 1;
+    uint32_t nbase = desc_base(lo, hi), nlim = desc_limit(lo, hi);
+    if (nlim < (n32 ? 0x67u : 0x2Bu))
+        fault_e(c, EXC_TS, SELX(sel));
+
+    /* Save the outgoing task. */
+    uint32_t ob = c->tr.base;
+    uint32_t fl = FLAGS;
+    if (kind == TS_IRET)
+        fl &= ~M86_NT;
+    if (c->tr.t32) {
+        phys_wr(c, ob + 0x20, 4, c->s.eip);
+        phys_wr(c, ob + 0x24, 4, fl);
+        for (int i = 0; i < 8; i++)
+            phys_wr(c, ob + 0x28 + 4 * (uint32_t)i, 4, R(i));
+        for (int i = 0; i < 6; i++)
+            phys_wr(c, ob + 0x48 + 4 * (uint32_t)i, 2, c->s.seg[i].sel);
+    } else {
+        phys_wr(c, ob + 0x0E, 2, c->s.eip);
+        phys_wr(c, ob + 0x10, 2, fl);
+        for (int i = 0; i < 8; i++)
+            phys_wr(c, ob + 0x12 + 2 * (uint32_t)i, 2, R(i));
+        for (int i = 0; i < 4; i++)
+            phys_wr(c, ob + 0x22 + 2 * (uint32_t)i, 2, c->s.seg[i].sel);
+    }
+    if (kind != TS_CALL) {
+        uint32_t a = c->gdtr.base + (c->tr.sel & 0xFFF8u) + 5;
+        phys_wr(c, a, 1, phys_rd(c, a, 1) & ~2u);
+    }
+    if (kind == TS_CALL)
+        phys_wr(c, nbase, 2, c->tr.sel);
+    if (kind != TS_IRET)
+        phys_wr(c, desc_addr(c, sel) + 5, 1, (hi >> 8) | 2);
+
+    c->tr.sel = sel;
+    c->tr.base = nbase;
+    c->tr.limit = nlim;
+    c->tr.t32 = (uint8_t)n32;
+    c->cr0 |= 8;
+
+    /* Load the incoming one. */
+    uint32_t nfl, neip, ldt;
+    uint16_t sg[6] = { 0, 0, 0, 0, 0, 0 };
+    if (n32) {
+        if (c->cr0 & 0x80000000u)
+            c->cr3 = phys_rd(c, nbase + 0x1C, 4);
+        neip = phys_rd(c, nbase + 0x20, 4);
+        nfl = phys_rd(c, nbase + 0x24, 4);
+        for (int i = 0; i < 8; i++)
+            R(i) = phys_rd(c, nbase + 0x28 + 4 * (uint32_t)i, 4);
+        for (int i = 0; i < 6; i++)
+            sg[i] = (uint16_t)phys_rd(c, nbase + 0x48 + 4 * (uint32_t)i, 2);
+        ldt = phys_rd(c, nbase + 0x60, 2);
+    } else {
+        neip = phys_rd(c, nbase + 0x0E, 2);
+        nfl = phys_rd(c, nbase + 0x10, 2);
+        for (int i = 0; i < 8; i++)
+            R(i) = 0xFFFF0000u | phys_rd(c, nbase + 0x12 + 2 * (uint32_t)i, 2);
+        for (int i = 0; i < 4; i++)
+            sg[i] = (uint16_t)phys_rd(c, nbase + 0x22 + 2 * (uint32_t)i, 2);
+        ldt = phys_rd(c, nbase + 0x2A, 2);
+    }
+    if (kind == TS_CALL)
+        nfl |= M86_NT;
+    FLAGS = (nfl & EFLAGS_MASK) | 2;
+
+    c->ldtr.sel = (uint16_t)ldt;
+    c->ldtr.base = 0;
+    c->ldtr.limit = 0;
+    if (ldt & 0xFFFCu) {
+        uint32_t a = c->gdtr.base + (ldt & 0xFFF8u);
+        uint32_t llo = phys_rd(c, a, 4), lhi = phys_rd(c, a + 4, 4);
+        if ((ldt & 4) || ((lhi >> 8) & 0x1F) != 2 || !(lhi & 0x8000))
+            fault_e(c, EXC_TS, SELX(ldt));
+        c->ldtr.base = desc_base(llo, lhi);
+        c->ldtr.limit = desc_limit(llo, lhi);
+    }
+
+    if (FLAGS & M86_VM) {
+        for (int i = 0; i < 6; i++)
+            seg_v86(c, i, sg[i]);
+        c->s.cpl = 3;
+        c->s.eip = neip & 0xFFFF;
+        return;
+    }
+    uint32_t clo, chi;
+    if (!descriptor(c, sg[M86_CS], &clo, &chi) || !(chi & 0x1000) || !(chi & 0x800))
+        fault_e(c, EXC_TS, SELX(sg[M86_CS]));
+    if (!(chi & 0x8000))
+        fault_e(c, EXC_NP, SELX(sg[M86_CS]));
+    seg_cache(c, M86_CS, sg[M86_CS], clo, chi);
+    c->s.cpl = sg[M86_CS] & 3;
+    c->s.eip = neip;
+    for (int i = 0; i < 6; i++) {
+        if (i == M86_CS)
+            continue;
+        c->s.seg[i].null = 1;       /* so that a fault leaves it unusable */
+        c->s.seg[i].sel = sg[i];
+    }
+    uint32_t slo, shi;
+    check_ss(c, sg[M86_SS], c->s.cpl, EXC_TS, &slo, &shi);
+    seg_cache(c, M86_SS, sg[M86_SS], slo, shi);
+    set_seg(c, M86_ES, sg[M86_ES]);
+    set_seg(c, M86_DS, sg[M86_DS]);
+    set_seg(c, M86_FS, sg[M86_FS]);
+    set_seg(c, M86_GS, sg[M86_GS]);
+    if (neip > c->s.seg[M86_CS].limit)
+        fault_e(c, EXC_GP, 0);
+}
+
 /* ---- control transfer ------------------------------------------ */
 
 static void jump_near(m86 *c, uint32_t eip)
@@ -470,59 +811,368 @@ static void jump_near(m86 *c, uint32_t eip)
     if (c->os == 2)
         eip &= 0xFFFF;
     if (eip > c->s.seg[M86_CS].limit)
-        fault(c, EXC_GP);
+        fault_e(c, EXC_GP, 0);
     c->s.eip = eip;
 }
 
-static void jump_far(m86 *c, uint16_t sel, uint32_t eip)
+/* A far jump or call. In protected mode the selector may name a code
+ * segment, a call gate, a task gate or a task state segment. */
+static void far_xfer(m86 *c, uint16_t sel, uint32_t off, int call)
 {
-    if (c->os == 2)
-        eip &= 0xFFFF;
-    /* (With PE set the limit that counts is the new segment's, and
-     * the fetch there finds out.) */
-    if (!(c->cr0 & 1) && eip > c->s.seg[M86_CS].limit)
-        fault(c, EXC_GP);
-    set_seg(c, M86_CS, sel);
-    c->s.eip = eip;
-}
-
-/* Deliver an interrupt or exception, real mode. */
-static void interrupt(m86 *c, int vec, uint32_t ret_eip)
-{
-    int ec = c->fault_ec;
-    c->fault_ec = 0;
-    if (c->cr0 & 1) {
-        /* Through a gate of the IDT, to the same privilege level: no
-         * stack switch, no task gate, nothing checked. A 32-bit gate
-         * pushes doublewords; an interrupt gate clears IF. Faults 8
-         * and 10 to 14 push an error code, here always zero. */
-        uint32_t g = c->idtr.base + (uint32_t)vec * 8;
-        uint32_t lo = phys_rd(c, g, 4), hi = phys_rd(c, g + 4, 4);
-        int size = (hi & 0x800) ? 4 : 2;
-        uint32_t off = (size == 4) ? ((hi & 0xFFFF0000u) | (lo & 0xFFFFu)) : (lo & 0xFFFFu);
-        push(c, size, FLAGS);
-        push(c, size, c->s.seg[M86_CS].sel);
-        push(c, size, ret_eip);
-        if (ec && (vec & 8))
-            push(c, size, 0);
-        if (!(hi & 0x100))
-            FLAGS &= ~M86_IF;
-        FLAGS &= ~M86_TF;
-        set_seg(c, M86_CS, (uint16_t)(lo >> 16));
+    int os = c->os;
+    if (os == 2)
+        off &= 0xFFFF;
+    if (!PMODE) {
+        if (call) {
+            push(c, os, c->s.seg[M86_CS].sel);
+            push(c, os, c->s.eip);
+        }
+        if (off > c->s.seg[M86_CS].limit)
+            fault_e(c, EXC_GP, 0);
+        m86_set_seg_real(c, M86_CS, sel);
         c->s.eip = off;
         return;
     }
-    uint32_t a = (uint32_t)vec * 4;
-    if (a + 3 > c->idtr.limit)
-        fault(c, EXC_GP);
-    uint32_t ip = phys_rd(c, c->idtr.base + a, 2);
-    uint32_t cs = phys_rd(c, c->idtr.base + a + 2, 2);
-    push(c, 2, FLAGS);
-    push(c, 2, c->s.seg[M86_CS].sel);
-    push(c, 2, ret_eip);
-    FLAGS &= ~(M86_IF | M86_TF);
-    set_seg(c, M86_CS, (uint16_t)cs);
-    c->s.eip = ip;
+    uint32_t lo, hi;
+    int cpl = c->s.cpl, rpl = sel & 3;
+    if ((sel & 0xFFFCu) == 0)
+        fault_e(c, EXC_GP, 0);
+    if (!descriptor(c, sel, &lo, &hi))
+        fault_e(c, EXC_GP, SELX(sel));
+    int dpl = (hi >> 13) & 3, p = (hi >> 15) & 1;
+    if (hi & 0x1000) {
+        if (!(hi & 0x800))
+            fault_e(c, EXC_GP, SELX(sel));
+        if (hi & 0x400) {
+            if (dpl > cpl)
+                fault_e(c, EXC_GP, SELX(sel));
+        } else if (rpl > cpl || dpl != cpl) {
+            fault_e(c, EXC_GP, SELX(sel));
+        }
+        if (!p)
+            fault_e(c, EXC_NP, SELX(sel));
+        if (call) {
+            push(c, os, c->s.seg[M86_CS].sel);
+            push(c, os, c->s.eip);
+        }
+        load_cs(c, sel, lo, hi, cpl, off);
+        return;
+    }
+    int type = (hi >> 8) & 15;
+    if (dpl < cpl || dpl < rpl)
+        fault_e(c, EXC_GP, SELX(sel));
+    switch (type) {
+    case 1: case 9:             /* a task state segment */
+        task_switch(c, sel, call ? TS_CALL : TS_JMP);
+        return;
+    case 5:                     /* a task gate */
+        if (!p)
+            fault_e(c, EXC_NP, SELX(sel));
+        task_switch(c, (uint16_t)(lo >> 16), call ? TS_CALL : TS_JMP);
+        return;
+    case 4: case 12: {          /* a call gate */
+        if (!p)
+            fault_e(c, EXC_NP, SELX(sel));
+        int gs = type == 12 ? 4 : 2;
+        uint16_t csel = (uint16_t)(lo >> 16);
+        uint32_t goff = gs == 4 ? ((hi & 0xFFFF0000u) | (lo & 0xFFFFu)) : (lo & 0xFFFFu);
+        int count = hi & 31;
+        uint32_t clo, chi;
+        if ((csel & 0xFFFCu) == 0)
+            fault_e(c, EXC_GP, 0);
+        if (!descriptor(c, csel, &clo, &chi))
+            fault_e(c, EXC_GP, SELX(csel));
+        int cdpl = (chi >> 13) & 3;
+        if (!(chi & 0x1000) || !(chi & 0x800) || cdpl > cpl)
+            fault_e(c, EXC_GP, SELX(csel));
+        if (!call && !(chi & 0x400) && cdpl != cpl)
+            fault_e(c, EXC_GP, SELX(csel));
+        if (!(chi & 0x8000))
+            fault_e(c, EXC_NP, SELX(csel));
+        uint32_t ret_cs = c->s.seg[M86_CS].sel, ret_ip = c->s.eip;
+        if (call && !(chi & 0x400) && cdpl < cpl) {
+            /* To an inner level: a new stack from the TSS, the old
+             * stack pointer and the parameters copied onto it. */
+            uint16_t nss;
+            uint32_t nesp, slo, shi, par[31];
+            tss_stack(c, cdpl, &nss, &nesp);
+            check_ss(c, nss, cdpl, EXC_TS, &slo, &shi);
+            uint32_t oss = c->s.seg[M86_SS].sel, oesp = R(M86_ESP);
+            for (int i = 0; i < count; i++)
+                par[i] = rd_mem(c, M86_SS, (oesp + (uint32_t)(i * gs)) & SP_MASK, gs);
+            c->s.cpl = (uint8_t)cdpl;
+            seg_cache(c, M86_SS, nss, slo, shi);
+            set_esp(c, nesp);
+            push(c, gs, oss);
+            push(c, gs, oesp);
+            for (int i = count - 1; i >= 0; i--)
+                push(c, gs, par[i]);
+            push(c, gs, ret_cs);
+            push(c, gs, ret_ip);
+            load_cs(c, csel, clo, chi, cdpl, goff);
+        } else {
+            if (call) {
+                push(c, gs, ret_cs);
+                push(c, gs, ret_ip);
+            }
+            load_cs(c, csel, clo, chi, cpl, goff);
+        }
+        return;
+    }
+    default:
+        fault_e(c, EXC_GP, SELX(sel));
+    }
+}
+
+/* The flag bits a POPF or IRET at level `cpl` may change. */
+static uint32_t flag_mask(m86 *c, int os, int cpl)
+{
+    uint32_t m = os == 2 ? 0xFFFFu : 0x00FCFFFFu;
+    if (c->cr0 & 1) {
+        m &= ~0x3200u;
+        if (cpl <= IOPL)
+            m |= M86_IF;
+        if (cpl == 0)
+            m |= 0x3000;
+    }
+    return m;
+}
+
+/* A far return (with `n` bytes of parameters to drop) or an IRET. */
+static void far_return(m86 *c, uint32_t n, int iret)
+{
+    int os = c->os, k = iret ? 3 : 2;
+    uint32_t sp = R(M86_ESP) & SP_MASK;
+#define SPO(x) ((sp + (uint32_t)(x)) & SP_MASK)
+
+    if (!PMODE) {
+        if (iret && (FLAGS & M86_VM) && IOPL < 3)
+            fault_e(c, EXC_GP, 0);
+        uint32_t off = pop(c, os);
+        uint32_t sel = pop(c, os);
+        uint32_t fl = iret ? pop(c, os) : 0;
+        set_esp(c, R(M86_ESP) + n);
+        if (os == 2)
+            off &= 0xFFFF;
+        if (off > c->s.seg[M86_CS].limit)
+            fault_e(c, EXC_GP, 0);
+        m86_set_seg_real(c, M86_CS, (uint16_t)sel);
+        c->s.eip = off;
+        if (iret)
+            write_flags(c, fl, flag_mask(c, os, 3));
+        return;
+    }
+    if (iret && (FLAGS & M86_NT)) {
+        task_switch(c, (uint16_t)phys_rd(c, c->tr.base, 2), TS_IRET);
+        return;
+    }
+    uint32_t off = rd_mem(c, M86_SS, SPO(0), os);
+    uint16_t sel = (uint16_t)rd_mem(c, M86_SS, SPO(os), 2);
+    uint32_t fl = iret ? rd_mem(c, M86_SS, SPO(2 * os), os) : 0;
+    int cpl = c->s.cpl, rpl = sel & 3;
+
+    if (iret && os == 4 && (fl & M86_VM) && cpl == 0) {
+        /* Back to a virtual 8086 task. */
+        uint32_t nesp = rd_mem(c, M86_SS, SPO(12), 4);
+        uint16_t sg[6];
+        sg[M86_SS] = (uint16_t)rd_mem(c, M86_SS, SPO(16), 2);
+        sg[M86_ES] = (uint16_t)rd_mem(c, M86_SS, SPO(20), 2);
+        sg[M86_DS] = (uint16_t)rd_mem(c, M86_SS, SPO(24), 2);
+        sg[M86_FS] = (uint16_t)rd_mem(c, M86_SS, SPO(28), 2);
+        sg[M86_GS] = (uint16_t)rd_mem(c, M86_SS, SPO(32), 2);
+        sg[M86_CS] = sel;
+        FLAGS = (fl & EFLAGS_MASK) | 2;
+        for (int i = 0; i < 6; i++)
+            seg_v86(c, i, sg[i]);
+        c->s.cpl = 3;
+        c->s.eip = off & 0xFFFF;
+        R(M86_ESP) = nesp;
+        return;
+    }
+
+    uint32_t lo, hi;
+    if ((sel & 0xFFFCu) == 0)
+        fault_e(c, EXC_GP, 0);
+    if (!descriptor(c, sel, &lo, &hi))
+        fault_e(c, EXC_GP, SELX(sel));
+    int dpl = (hi >> 13) & 3;
+    if (rpl < cpl || !(hi & 0x1000) || !(hi & 0x800))
+        fault_e(c, EXC_GP, SELX(sel));
+    if ((hi & 0x400) ? dpl > rpl : dpl != rpl)
+        fault_e(c, EXC_GP, SELX(sel));
+    if (!(hi & 0x8000))
+        fault_e(c, EXC_NP, SELX(sel));
+    if (os == 2)
+        off &= 0xFFFF;
+
+    if (rpl == cpl) {
+        set_esp(c, sp + (uint32_t)(k * os) + n);
+        load_cs(c, sel, lo, hi, cpl, off);
+    } else {
+        /* To an outer level: its stack pointer is on this stack. */
+        uint32_t nesp = rd_mem(c, M86_SS, SPO(k * os + (int)n), os);
+        uint16_t nss = (uint16_t)rd_mem(c, M86_SS, SPO(k * os + (int)n + os), 2);
+        uint32_t slo, shi;
+        check_ss(c, nss, rpl, EXC_GP, &slo, &shi);
+        load_cs(c, sel, lo, hi, rpl, off);
+        seg_cache(c, M86_SS, nss, slo, shi);
+        if (os == 4)
+            R(M86_ESP) = nesp;
+        else
+            R(M86_ESP) = (R(M86_ESP) & 0xFFFF0000u) | (nesp & 0xFFFF);
+        set_esp(c, R(M86_ESP) + n);
+        /* Data segments the outer level may not have are emptied. */
+        static const int ds[4] = { M86_ES, M86_DS, M86_FS, M86_GS };
+        for (int i = 0; i < 4; i++) {
+            m86_seg *s = &c->s.seg[ds[i]];
+            if (!s->null && !s->cc && s->dpl < rpl) {
+                s->sel = 0;
+                s->null = 1;
+            }
+        }
+    }
+    if (iret)
+        write_flags(c, fl, flag_mask(c, os, cpl));
+#undef SPO
+}
+
+/* I/O from a level the I/O privilege level does not cover, or from a
+ * virtual 8086 task, is allowed port by port by the bitmap in the TSS. */
+static void io_check(m86 *c, uint32_t port, int size)
+{
+    if (!(c->cr0 & 1))
+        return;
+    if (!(FLAGS & M86_VM) && c->s.cpl <= IOPL)
+        return;
+    if (!c->tr.t32 || c->tr.limit < 0x67)
+        fault_e(c, EXC_GP, 0);
+    uint32_t base = phys_rd(c, c->tr.base + 0x66, 2);
+    if (base + (port + (uint32_t)size - 1) / 8 > c->tr.limit)
+        fault_e(c, EXC_GP, 0);
+    uint32_t bits = phys_rd(c, c->tr.base + base + port / 8, 1);
+    if (base + port / 8 + 1 <= c->tr.limit)
+        bits |= phys_rd(c, c->tr.base + base + port / 8 + 1, 1) << 8;
+    if ((bits >> (port & 7)) & ((1u << size) - 1))
+        fault_e(c, EXC_GP, 0);
+}
+
+/* Only level 0 may. */
+static void privileged(m86 *c)
+{
+    if ((c->cr0 & 1) && c->s.cpl != 0)
+        fault_e(c, EXC_GP, 0);
+}
+
+/* Deliver an interrupt or an exception. kind: INT_SOFT for INT n,
+ * INT3 and INTO; INT_EXT for a hardware interrupt; INT_FAULT for a
+ * fault, which may push an error code. */
+enum { INT_SOFT, INT_EXT, INT_FAULT };
+
+static int has_error_code(int vec)
+{
+    return vec == 8 || (vec >= 10 && vec <= 14) || vec == 17;
+}
+
+static void interrupt(m86 *c, int vec, uint32_t ret_eip, int kind)
+{
+    if (!(c->cr0 & 1)) {
+        uint32_t a = (uint32_t)vec * 4;
+        if (a + 3 > c->idtr.limit)
+            fault(c, EXC_GP);
+        uint32_t ip = phys_rd(c, c->idtr.base + a, 2);
+        uint32_t cs = phys_rd(c, c->idtr.base + a + 2, 2);
+        push(c, 2, FLAGS);
+        push(c, 2, c->s.seg[M86_CS].sel);
+        push(c, 2, ret_eip);
+        FLAGS &= ~(M86_IF | M86_TF);
+        m86_set_seg_real(c, M86_CS, (uint16_t)cs);
+        c->s.eip = ip;
+        return;
+    }
+
+    uint32_t ext = kind != INT_SOFT;
+    uint32_t idx = (uint32_t)vec * 8 + 2;
+    uint32_t err = c->err;
+    int ec = kind == INT_FAULT && has_error_code(vec);
+    if ((uint32_t)vec * 8 + 7 > c->idtr.limit)
+        fault_e(c, EXC_GP, idx + ext);
+    uint32_t g = c->idtr.base + (uint32_t)vec * 8;
+    uint32_t lo = phys_rd(c, g, 4), hi = phys_rd(c, g + 4, 4);
+    int type = (hi >> 8) & 0x1F, gdpl = (hi >> 13) & 3;
+    int cpl = c->s.cpl;
+    if (type != 5 && type != 6 && type != 7 && type != 14 && type != 15)
+        fault_e(c, EXC_GP, idx + ext);
+    if (kind == INT_SOFT && gdpl < cpl)
+        fault_e(c, EXC_GP, idx);
+    if (!(hi & 0x8000))
+        fault_e(c, EXC_NP, idx + ext);
+    uint32_t oflags = FLAGS;
+
+    if (type == 5) {            /* a task gate */
+        c->s.eip = ret_eip;
+        task_switch(c, (uint16_t)(lo >> 16), TS_CALL);
+        if (ec)
+            push(c, c->tr.t32 ? 4 : 2, err);
+        return;
+    }
+
+    int size = (type & 8) ? 4 : 2;
+    uint16_t sel = (uint16_t)(lo >> 16);
+    uint32_t off = size == 4 ? ((hi & 0xFFFF0000u) | (lo & 0xFFFFu)) : (lo & 0xFFFFu);
+    uint32_t clo, chi;
+    if ((sel & 0xFFFCu) == 0)
+        fault_e(c, EXC_GP, ext);
+    if (!descriptor(c, sel, &clo, &chi))
+        fault_e(c, EXC_GP, SELX(sel) + ext);
+    int dpl = (chi >> 13) & 3;
+    if (!(chi & 0x1000) || !(chi & 0x800) || dpl > cpl)
+        fault_e(c, EXC_GP, SELX(sel) + ext);
+    if (!(chi & 0x8000))
+        fault_e(c, EXC_NP, SELX(sel) + ext);
+    uint32_t ocs = c->s.seg[M86_CS].sel;
+
+    if (!(chi & 0x400) && dpl < cpl) {
+        /* To an inner level, on the stack the TSS gives for it. */
+        uint16_t nss;
+        uint32_t nesp, slo, shi;
+        int vm = (FLAGS & M86_VM) != 0;
+        if (vm && dpl != 0)
+            fault_e(c, EXC_GP, SELX(sel) + ext);
+        tss_stack(c, dpl, &nss, &nesp);
+        check_ss(c, nss, dpl, EXC_TS, &slo, &shi);
+        uint32_t oss = c->s.seg[M86_SS].sel, oesp = R(M86_ESP);
+        uint16_t og[4] = { c->s.seg[M86_ES].sel, c->s.seg[M86_DS].sel,
+                           c->s.seg[M86_FS].sel, c->s.seg[M86_GS].sel };
+        FLAGS &= ~M86_VM;
+        c->s.cpl = (uint8_t)dpl;
+        seg_cache(c, M86_SS, nss, slo, shi);
+        set_esp(c, nesp);
+        if (vm) {
+            static const int ds[4] = { M86_ES, M86_DS, M86_FS, M86_GS };
+            for (int i = 3; i >= 0; i--) {
+                push(c, size, og[i]);
+                c->s.seg[ds[i]].sel = 0;
+                c->s.seg[ds[i]].null = 1;
+            }
+        }
+        push(c, size, oss);
+        push(c, size, oesp);
+        cpl = dpl;
+    } else {
+        if (FLAGS & M86_VM)
+            fault_e(c, EXC_GP, SELX(sel) + ext);
+        if (!(chi & 0x400) && dpl != cpl)
+            fault_e(c, EXC_GP, SELX(sel) + ext);
+    }
+    push(c, size, oflags);
+    push(c, size, ocs);
+    push(c, size, ret_eip);
+    if (ec)
+        push(c, size, err);
+    if (!(type & 1))
+        FLAGS &= ~M86_IF;
+    FLAGS &= ~(M86_TF | M86_NT | M86_VM | 0x10000u);
+    load_cs(c, sel, clo, chi, cpl, off);
 }
 
 /* ---- arithmetic helpers ---------------------------------------- */
@@ -692,12 +1342,21 @@ static void string_op(m86 *c, int op, int size)
         switch (op) {
         case 0x6C: case 0x6D:       /* INS */
             /* Check the destination before the port is read. */
-            linear(c, M86_ES, di, size);
+            io_check(c, R(M86_EDX) & 0xFFFF, size);
+            {
+                /* ... and with paging, that its pages can be written. */
+                uint32_t la = linear(c, M86_ES, di, size, 1);
+                if (c->cr0 & 0x80000000u) {
+                    translate(c, la, 1, c->s.cpl == 3);
+                    translate(c, la + (uint32_t)size - 1, 1, c->s.cpl == 3);
+                }
+            }
             wr_mem(c, M86_ES, di, size,
                    c->io_read(c->bus, (uint16_t)R(M86_EDX), size));
             use_di = 1;
             break;
         case 0x6E: case 0x6F:       /* OUTS */
+            io_check(c, R(M86_EDX) & 0xFFFF, size);
             c->io_write(c->bus, (uint16_t)R(M86_EDX), size,
                         rd_mem(c, sseg, si, size));
             use_si = 1;
@@ -787,19 +1446,6 @@ static void bit_op(m86 *c, int kind, int imm)
     }
 }
 
-/* The two halves of the descriptor a selector names; 0 if it names
- * none (the null selector, or one outside its table). */
-static int descriptor(m86 *c, uint16_t sel, uint32_t *lo, uint32_t *hi)
-{
-    uint32_t lim = (sel & 4) ? c->ldtr.limit : c->gdtr.limit;
-    uint32_t a = ((sel & 4) ? c->ldtr.base : c->gdtr.base) + (sel & 0xFFF8u);
-    if ((sel & 0xFFFCu) == 0 || (uint32_t)(sel | 7) > lim)
-        return 0;
-    *lo = phys_rd(c, a, 4);
-    *hi = phys_rd(c, a + 4, 4);
-    return 1;
-}
-
 static void exec_0f(m86 *c)
 {
     int op = fetch8(c);
@@ -809,7 +1455,7 @@ static void exec_0f(m86 *c)
 
     switch (op) {
     case 0x00:                  /* the local table and the task register */
-        if (!(c->cr0 & 1))
+        if (!PMODE)
             fault(c, EXC_UD);
         decode_modrm(c);
         switch (c->reg) {
@@ -821,17 +1467,40 @@ static void exec_0f(m86 *c)
                 wr_mem(c, c->ea_seg, c->ea_off, 2, v);
             break;
         case 2: {               /* LLDT: the table's base from its descriptor in the GDT */
+            uint32_t lo, hi;
+            privileged(c);
             v = rd_rm(c, 2);
-            uint32_t a = c->gdtr.base + (v & 0xFFF8u);
-            uint32_t lo = phys_rd(c, a, 4), hi = phys_rd(c, a + 4, 4);
+            if ((v & 0xFFFCu) == 0) {
+                c->ldtr.sel = (uint16_t)v;
+                c->ldtr.base = c->ldtr.limit = 0;
+                break;
+            }
+            if ((v & 4) || !descriptor(c, (uint16_t)v, &lo, &hi) || ((hi >> 8) & 0x1F) != 2)
+                fault_e(c, EXC_GP, SELX(v));
+            if (!(hi & 0x8000))
+                fault_e(c, EXC_NP, SELX(v));
             c->ldtr.sel = (uint16_t)v;
-            c->ldtr.base = (hi & 0xFF000000u) | ((hi & 0xFFu) << 16) | (lo >> 16);
-            c->ldtr.limit = (uint16_t)lo;
+            c->ldtr.base = desc_base(lo, hi);
+            c->ldtr.limit = desc_limit(lo, hi);
             break;
         }
-        case 3:                 /* LTR: the selector is kept; there are no tasks yet */
-            c->tr.sel = (uint16_t)rd_rm(c, 2);
+        case 3: {               /* LTR: an available TSS, which becomes busy */
+            uint32_t lo, hi;
+            privileged(c);
+            v = rd_rm(c, 2);
+            if ((v & 0xFFFCu) == 0)
+                fault_e(c, EXC_GP, 0);
+            if ((v & 4) || !descriptor(c, (uint16_t)v, &lo, &hi) || ((hi >> 8) & 0x17) != 1)
+                fault_e(c, EXC_GP, SELX(v));
+            if (!(hi & 0x8000))
+                fault_e(c, EXC_NP, SELX(v));
+            phys_wr(c, desc_addr(c, (uint16_t)v) + 5, 1, (hi >> 8) | 2);
+            c->tr.sel = (uint16_t)v;
+            c->tr.base = desc_base(lo, hi);
+            c->tr.limit = desc_limit(lo, hi);
+            c->tr.t32 = (hi >> 11) & 1;
             break;
+        }
         case 4: case 5: {       /* VERR, VERW */
             uint32_t lo, hi;
             v = rd_rm(c, 2);
@@ -840,7 +1509,10 @@ static void exec_0f(m86 *c)
                 break;
             }
             int code = (hi >> 11) & 1, bit9 = (hi >> 9) & 1, seg = (hi >> 12) & 1;
+            int dpl = (hi >> 13) & 3, conf = code && ((hi >> 10) & 1);
             int ok = seg && (c->reg == 4 ? (!code || bit9) : (!code && bit9));
+            if (!conf && (dpl < c->s.cpl || dpl < (int)(v & 3)))
+                ok = 0;
             set_flag(c, M86_ZF, ok);
             break;
         }
@@ -848,9 +1520,9 @@ static void exec_0f(m86 *c)
             fault(c, EXC_UD);
         }
         break;
-    case 0x02: case 0x03: {     /* LAR, LSL: privilege and type are not looked at */
+    case 0x02: case 0x03: {     /* LAR, LSL */
         uint32_t lo, hi;
-        if (!(c->cr0 & 1))
+        if (!PMODE)
             fault(c, EXC_UD);
         decode_modrm(c);
         v = rd_rm(c, 2);
@@ -858,13 +1530,24 @@ static void exec_0f(m86 *c)
             FLAGS &= ~M86_ZF;
             break;
         }
+        int type = (hi >> 8) & 0x1F, dpl = (hi >> 13) & 3;
+        int conf = (type & 0x1C) == 0x1C, ok;
+        if (type & 0x10)
+            ok = 1;
+        else if (op == 0x02)    /* TSS, LDT, call gate, task gate */
+            ok = (0x1A3E >> type) & 1;
+        else                    /* what has a limit: TSS, LDT */
+            ok = (0x0A0E >> type) & 1;
+        if (!conf && (dpl < c->s.cpl || dpl < (int)(v & 3)))
+            ok = 0;
+        if (!ok) {
+            FLAGS &= ~M86_ZF;
+            break;
+        }
         if (op == 0x02)
             v = hi & 0x00F0FF00u;
-        else {
-            v = (hi & 0x000F0000u) | (lo & 0xFFFFu);
-            if (hi & 0x00800000u)
-                v = (v << 12) | 0xFFFu;
-        }
+        else
+            v = desc_limit(lo, hi);
         wr_reg(c, os, c->reg, v);
         FLAGS |= M86_ZF;
         break;
@@ -884,6 +1567,7 @@ static void exec_0f(m86 *c)
         case 2: case 3: {       /* LGDT, LIDT */
             if (c->mod == 3)
                 fault(c, EXC_UD);
+            privileged(c);
             uint16_t lim = (uint16_t)rd_mem(c, c->ea_seg, c->ea_off, 2);
             uint32_t base = rd_mem(c, c->ea_seg, ea_plus(c, 2), 4);
             if (os == 2)
@@ -904,22 +1588,26 @@ static void exec_0f(m86 *c)
                 wr_mem(c, c->ea_seg, c->ea_off, 2, c->cr0);
             break;
         case 6:                 /* LMSW: cannot clear PE */
+            privileged(c);
             v = rd_rm(c, 2);
             c->cr0 = (c->cr0 & ~0xEu) | (v & 0xF) | (c->cr0 & 1);
             break;
-        case 7:                 /* INVLPG (a 486's): no paging, nothing to do */
+        case 7:                 /* INVLPG (a 486's): the model keeps no translations */
             if (c->mod == 3)
                 fault(c, EXC_UD);
+            privileged(c);
             break;
         default:
             fault(c, EXC_UD);
         }
         break;
     case 0x06:                  /* CLTS */
+        privileged(c);
         c->cr0 &= ~8u;
         break;
     case 0x20:                  /* MOV r32, CRn */
         decode_modrm(c);
+        privileged(c);
         if (c->reg == 0)
             R(c->rm) = c->cr0;
         else if (c->reg == 2)
@@ -931,10 +1619,11 @@ static void exec_0f(m86 *c)
         break;
     case 0x22:                  /* MOV CRn, r32 */
         decode_modrm(c);
+        privileged(c);
         if (c->reg == 0) {
             c->cr0 = R(c->rm);
-            if (c->cr0 & 0x80000000u)
-                c->unsupported = 1;     /* paging */
+            if (!(c->cr0 & 1))
+                c->s.cpl = 0;
         } else if (c->reg == 2) {
             c->cr2 = R(c->rm);
         } else if (c->reg == 3) {
@@ -945,10 +1634,12 @@ static void exec_0f(m86 *c)
         break;
     case 0x21:                  /* MOV r32, DRn */
         decode_modrm(c);
+        privileged(c);
         R(c->rm) = c->dr[c->reg];
         break;
     case 0x23:                  /* MOV DRn, r32 */
         decode_modrm(c);
+        privileged(c);
         c->dr[c->reg] = R(c->rm);
         break;
     case 0x80 ... 0x8F: {       /* Jcc rel16/32 */
@@ -1025,6 +1716,7 @@ static void exec_0f(m86 *c)
         break;
     /* ---- a 486's ---- */
     case 0x08: case 0x09:       /* INVD, WBINVD: there is no cache to empty */
+        privileged(c);
         break;
     case 0xC8 ... 0xCF:         /* BSWAP */
         v = R(op & 7);
@@ -1339,19 +2031,23 @@ static void exec(m86 *c)
     case 0x9A: {                /* CALL far */
         uint32_t off = fetch(c, os);
         uint16_t sel = (uint16_t)fetch(c, 2);
-        push(c, os, c->s.seg[M86_CS].sel);
-        push(c, os, c->s.eip);
-        jump_far(c, sel, off);
+        far_xfer(c, sel, off, 1);
         break;
     }
     case 0x9B:                  /* WAIT */
         if ((c->cr0 & 0xA) == 0xA)
             fault(c, EXC_NM);
         break;
-    case 0x9C: push(c, os, FLAGS & 0x00FCFFFFu); break;
+    case 0x9C:
+        if ((FLAGS & M86_VM) && IOPL < 3)
+            fault_e(c, EXC_GP, 0);
+        push(c, os, FLAGS & 0x00FCFFFFu);
+        break;
     case 0x9D:
+        if ((FLAGS & M86_VM) && IOPL < 3)
+            fault_e(c, EXC_GP, 0);
         v = pop(c, os);
-        write_flags(c, v, os == 2 ? 0xFFFFu : 0x00FCFFFFu);
+        write_flags(c, v, flag_mask(c, os, c->s.cpl));
         break;
     case 0x9E:
         write_flags(c, R(M86_EAX) >> 8, 0xD5);
@@ -1423,6 +2119,10 @@ static void exec(m86 *c)
             }
             push(c, os, frame);
         }
+        /* With paging on, the page the final stack pointer is in must
+         * be writable. */
+        if (c->cr0 & 0x80000000u)
+            translate(c, c->s.seg[M86_SS].base + ((R(M86_ESP) - alloc) & SP_MASK), 1, c->s.cpl == 3);
         wr_reg(c, os, M86_EBP, frame);
         R(M86_ESP) = (R(M86_ESP) & ~SP_MASK) | ((R(M86_ESP) - alloc) & SP_MASK);
         break;
@@ -1434,27 +2134,22 @@ static void exec(m86 *c)
         break;
     case 0xCA: case 0xCB: {     /* RET far */
         uint32_t n = op == 0xCA ? fetch(c, 2) : 0;
-        uint32_t off = pop(c, os);
-        uint32_t sel = pop(c, os);
-        R(M86_ESP) = (R(M86_ESP) & ~SP_MASK) | ((R(M86_ESP) + n) & SP_MASK);
-        jump_far(c, (uint16_t)sel, off);
+        far_return(c, n, 0);
         break;
     }
-    case 0xCC: interrupt(c, EXC_BP, c->s.eip); break;
+    case 0xCC: interrupt(c, EXC_BP, c->s.eip, INT_SOFT); break;
     case 0xCD:
         v = fetch8(c);
-        interrupt(c, (int)v, c->s.eip);
+        if ((FLAGS & M86_VM) && IOPL < 3)
+            fault_e(c, EXC_GP, 0);
+        interrupt(c, (int)v, c->s.eip, INT_SOFT);
         break;
     case 0xCE:
         if (FLAGS & M86_OF)
-            interrupt(c, EXC_OF, c->s.eip);
+            interrupt(c, EXC_OF, c->s.eip, INT_SOFT);
         break;
     case 0xCF: {                /* IRET */
-        uint32_t off = pop(c, os);
-        uint32_t sel = pop(c, os);
-        uint32_t fl = pop(c, os);
-        jump_far(c, (uint16_t)sel, off);
-        write_flags(c, fl, os == 2 ? 0xFFFFu : 0x00FCFFFFu);
+        far_return(c, 0, 1);
         break;
     }
 
@@ -1511,17 +2206,21 @@ static void exec(m86 *c)
     }
     case 0xE4: case 0xE5:
         v = fetch8(c);
+        io_check(c, v, size);
         wr_reg(c, size, M86_EAX, c->io_read(c->bus, (uint16_t)v, size));
         break;
     case 0xE6: case 0xE7:
         v = fetch8(c);
+        io_check(c, v, size);
         c->io_write(c->bus, (uint16_t)v, size, rd_reg(c, size, M86_EAX));
         break;
     case 0xEC: case 0xED:
+        io_check(c, R(M86_EDX) & 0xFFFF, size);
         wr_reg(c, size, M86_EAX,
                c->io_read(c->bus, (uint16_t)R(M86_EDX), size));
         break;
     case 0xEE: case 0xEF:
+        io_check(c, R(M86_EDX) & 0xFFFF, size);
         c->io_write(c->bus, (uint16_t)R(M86_EDX), size,
                     rd_reg(c, size, M86_EAX));
         break;
@@ -1539,7 +2238,7 @@ static void exec(m86 *c)
     case 0xEA: {
         uint32_t off = fetch(c, os);
         uint16_t sel = (uint16_t)fetch(c, 2);
-        jump_far(c, sel, off);
+        far_xfer(c, sel, off, 0);
         break;
     }
     case 0xEB: {
@@ -1548,14 +2247,20 @@ static void exec(m86 *c)
         break;
     }
 
-    case 0xF1: interrupt(c, EXC_DB, c->s.eip); break;
-    case 0xF4: c->halted = 1; break;
+    case 0xF1: interrupt(c, EXC_DB, c->s.eip, INT_SOFT); break;
+    case 0xF4: privileged(c); c->halted = 1; break;
     case 0xF5: FLAGS ^= M86_CF; break;
     case 0xF6: case 0xF7: decode_modrm(c); group3(c, size); break;
     case 0xF8: FLAGS &= ~M86_CF; break;
     case 0xF9: FLAGS |= M86_CF; break;
-    case 0xFA: FLAGS &= ~M86_IF; break;
+    case 0xFA:
+        if ((c->cr0 & 1) && c->s.cpl > IOPL)
+            fault_e(c, EXC_GP, 0);
+        FLAGS &= ~M86_IF;
+        break;
     case 0xFB:
+        if ((c->cr0 & 1) && c->s.cpl > IOPL)
+            fault_e(c, EXC_GP, 0);
         if (!(FLAGS & M86_IF))
             c->irq_inhibit = 1;
         FLAGS |= M86_IF;
@@ -1588,11 +2293,7 @@ static void exec(m86 *c)
                 fault(c, EXC_UD);
             uint32_t off = rd_mem(c, c->ea_seg, c->ea_off, os);
             uint32_t sel = rd_mem(c, c->ea_seg, ea_plus(c, os), 2);
-            if (c->reg == 3) {
-                push(c, os, c->s.seg[M86_CS].sel);
-                push(c, os, c->s.eip);
-            }
-            jump_far(c, (uint16_t)sel, off);
+            far_xfer(c, (uint16_t)sel, off, c->reg == 3);
             break;
         }
         case 6:
@@ -1603,8 +2304,20 @@ static void exec(m86 *c)
         }
         break;
 
+    case 0x63: {                /* ARPL: not recognised outside protected mode */
+        if (!PMODE)
+            fault(c, EXC_UD);
+        decode_modrm(c);
+        uint32_t d = rd_rm(c, 2), r = rd_reg(c, 2, c->reg);
+        if ((d & 3) < (r & 3)) {
+            wr_rm(c, 2, (d & ~3u) | (r & 3));
+            FLAGS |= M86_ZF;
+        } else {
+            FLAGS &= ~M86_ZF;
+        }
+        break;
+    }
     default:
-        /* 0x63 (ARPL) is not recognised in real mode. */
         fault(c, EXC_UD);
     }
 }
@@ -1717,8 +2430,8 @@ static void deliver_fault(m86 *c, volatile int vec)
     if (flog > 0 && (c->cr0 & 1)) {
         uint32_t la = c->snap.seg[M86_CS].base + c->snap.eip;
         flog--;
-        fprintf(stderr, "fault %d at %04x:%08x (D=%d):", vec, c->snap.seg[M86_CS].sel,
-                c->snap.eip, c->snap.seg[M86_CS].d);
+        fprintf(stderr, "fault %d (code %x, level %d) at %04x:%08x (D=%d):", vec, c->err,
+                c->snap.cpl, c->snap.seg[M86_CS].sel, c->snap.eip, c->snap.seg[M86_CS].d);
         for (int k = 0; k < 12; k++)
             fprintf(stderr, " %02x", c->mem_read(c->bus, la + (uint32_t)k));
         fprintf(stderr, "\n");
@@ -1726,17 +2439,29 @@ static void deliver_fault(m86 *c, volatile int vec)
     for (;;) {
         c->s = c->snap;
         c->last_exception = vec;
+        volatile int first = vec;
         int again = setjmp(c->fault_jmp);
         if (!again) {
-            c->fault_ec = 1;
-            interrupt(c, vec, c->snap.eip);
+            interrupt(c, vec, c->snap.eip, INT_FAULT);
             return;
         }
-        if (++c->fault_depth >= 2) {
+        /* A fault while delivering one. Two of the contributory kind,
+         * or anything of those after a page fault, make a double
+         * fault; a fault delivering that stops the CPU. Otherwise the
+         * new fault is simply the one delivered. */
+        int second = again - 1;
+        int c1 = first == 0 || (first >= 10 && first <= 13);
+        int c2 = second == 0 || (second >= 10 && second <= 13);
+        if (first == EXC_DF || ++c->fault_depth >= 4) {
             c->shutdown = 1;
             return;
         }
-        vec = EXC_DF;
+        if ((c1 && c2) || (first == EXC_PF && (c2 || second == EXC_PF))) {
+            vec = EXC_DF;
+            c->err = 0;
+        } else {
+            vec = second;
+        }
     }
 }
 
@@ -1762,7 +2487,7 @@ void m86_step(m86 *c)
         if (f)
             deliver_fault(c, f - 1);
         else
-            interrupt(c, vec, c->s.eip);
+            interrupt(c, vec, c->s.eip, INT_EXT);
         return;
     }
     if (c->halted)
@@ -1778,6 +2503,32 @@ void m86_step(m86 *c)
     c->reg = 0;
     c->taken = 0;
 
+    /* M86_BREAK=offset (hex) in the environment: when execution first
+     * reaches that offset, say where the last instructions were. */
+    {
+        static uint32_t brk, ring[16][3];
+        static int init, at;
+        if (!init) {
+            init = 1;
+            brk = getenv("M86_BREAK") ? (uint32_t)strtoul(getenv("M86_BREAK"), 0, 16) : 0xFFFFFFFFu;
+            if (brk == 0xFFFFFFFFu)
+                init = 2;
+        }
+        if (init == 1) {
+            ring[at][0] = c->s.seg[M86_CS].sel;
+            ring[at][1] = c->s.eip;
+            ring[at][2] = R(M86_ESP);
+            at = (at + 1) & 15;
+            if (c->s.eip == brk) {
+                for (int i = 0; i < 16; i++)
+                    fprintf(stderr, "before: %04x:%08x esp=%08x\n", ring[(at + i) & 15][0],
+                            ring[(at + i) & 15][1], ring[(at + i) & 15][2]);
+                fprintf(stderr, "eax=%08x ecx=%08x edx=%08x ebx=%08x ebp=%08x esi=%08x edi=%08x\n",
+                        R(0), R(1), R(2), R(3), R(5), R(6), R(7));
+                init = 2;
+            }
+        }
+    }
     int trap = (FLAGS & M86_TF) != 0;
     int f = setjmp(c->fault_jmp);
     if (f) {
@@ -1797,6 +2548,6 @@ void m86_step(m86 *c)
         if (f)
             deliver_fault(c, f - 1);
         else
-            interrupt(c, EXC_DB, c->s.eip);
+            interrupt(c, EXC_DB, c->s.eip, INT_FAULT);
     }
 }

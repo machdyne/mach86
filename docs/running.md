@@ -118,9 +118,46 @@ Shareware games go on D:. Two have been run on a Sergei ML2:
 - **The Secret of Monkey Island demo** needs `SLOW 5` before it is
   started with AdLib sound (`midemo a`): its sound driver divides by
   zero on a machine this fast, as it does on a real 486.
-- **DOOM** (shareware 1.9): `doom -nosound`. It pauses for a minute
-  or so at `R_Init`. Sound in DOOM has not been tried; there is no
-  Sound Blaster, so effects could only come from the PC speaker.
+- **DOOM** (shareware 1.9): `doom -nosound` is what has run on a
+  board. It pauses for a minute or so at `R_Init`. Since round 30
+  there is a Sound Blaster, **untested on a board**: for sound,
+  DOOM wants a `DEFAULT.CFG` beside it that names the card (its
+  `SETUP.EXE` writes one; the lines that matter are below), and is
+  then started as plain `doom`. On the model it plays effects
+  through the Sound Blaster and music through the AdLib.
+
+  ```
+  snd_musicdevice		2
+  snd_sfxdevice		3
+  snd_sbport		544
+  snd_sbirq		7
+  snd_sbdma		1
+  ```
+
+`SBTEST` on C: plays a short tone twice through the Sound Blaster
+and says whether the card answered as it should.
+
+## A memory manager (untested on a board)
+
+Since round 29 the CPU has paging and virtual 8086 mode, which is
+what a memory manager of the EMM386 kind needs. In simulation
+Jemm386 loads and DOS, the speed test and DOOM run under it
+([pmode.md](pmode.md#tests)); nobody has tried it on a board yet.
+To try: build or download `JEMM386.EXE`
+(github.com/Baron-von-Riedesel/Jemm), put it on D:, and at the
+prompt:
+
+```
+D:\>jemm386 load
+Jemm386 loaded
+D:\>c:\speed
+```
+
+`SPEED` should then print roughly half of what it prints without
+(paging costs every memory access two or three cycles). `JEMM386
+UNLOAD` goes back to real mode. If the machine hangs or resets
+instead, that is worth knowing: it is the first time this part of
+the CPU has met real hardware.
 
 ## If it does not work
 

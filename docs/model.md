@@ -38,8 +38,16 @@ mode as [pmode.md](pmode.md) lists.
   delay after `MOV SS`, `POP SS` and `STI` are modelled.
 - There is no coprocessor. Escape opcodes do nothing, or raise the
   device-not-available fault when `CR0.EM` or `CR0.TS` is set.
-- Protected mode is not there. Setting `CR0.PE` stops the model and
-  says so.
+- Protected mode is whole, as far as a 386 without debug registers
+  goes (round 28): the four privilege levels with every check on
+  segment loads, far transfers, gates and flags, and the faults and
+  error codes those raise; stack switches through the task state
+  segment; call gates with their parameters; task switches, 286 and
+  386, by jump, call, gate, interrupt and `IRET`; virtual 8086 mode
+  with the I/O permission bitmap; paging, with the accessed and dirty
+  bits, CR0.WP and page faults; double faults and shutdown. The core
+  has less ([pmode.md](pmode.md)): where the two differ, software
+  that needs the missing part runs on the model only.
 
 The model observes the clean-room rule ([cleanroom.md](cleanroom.md)):
 it is written from the Intel manuals, and corrected against
@@ -158,6 +166,16 @@ line:
 m86pc -bios bios.bin -disk disk.img \
       -expect "A>" -type "dir\r" -expect "bytes free"
 ```
+
+A ROM of up to 128 KB can be given to `-bios` (it ends at FFFFFh;
+the machines themselves have 64 KB): test suites that replace the
+BIOS come that size. Four things in the environment help with them
+and with protected-mode programs: `M86_POST=1` prints every byte
+written to the diagnostic port 190h; `M86_E9=1` sends bytes written
+to port E9h to standard output; `M86_FAULTS=n` prints the first n
+faults taken with PE set (vector, error code, level, address and
+bytes); `M86_BREAK=offset` (hexadecimal) prints the sixteen
+instructions before execution first reaches that offset.
 
 `-expect` runs until the text appears on a screen row that changed
 since the previous step, and the exit status says whether every

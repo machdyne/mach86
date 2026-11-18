@@ -19,8 +19,8 @@ static uint8_t mem_read(void *bus, uint32_t a)
 {
     pc *p = bus;
     a = a20_mask(p, a);
-    if (a >= 0xF0000 && a < 0x100000)
-        return p->rom[a - 0xF0000];
+    if (a >= 0x100000 - p->rom_size && a < 0x100000)
+        return p->rom[a - 0xE0000];
     if (a >= 0xA0000 && a < 0x100000)
         return a < 0xC0000 ? vga_mem_read(&p->vga, a) : 0xFF;
     if (a < 0xA0000)
@@ -173,6 +173,203 @@ static void pit_advance(pc *p, uint32_t ticks)
             ch->out = ch->remain > ch->reload / 2;
         else if (ch->mode != 0)
             ch->out = ch->remain != 1;
+    }
+}
+
+/* ---- Sound Blaster ------------------------------------------------ */
+
+#define SB_IRQ 7
+
+static void sb_out(pc *p, uint8_t v)
+{
+    if (p->sb.out_n < 4)
+        p->sb.out[p->sb.out_n++] = v;
+}
+
+static void sb_reset(pc *p)
+{
+    void *wav = p->sb.wav;
+    memset(&p->sb, 0, sizeof p->sb);
+    p->sb.wav = wav;
+    p->sb.dac = 0x80;
+    p->sb.tc = 0xD2;                    /* about 22 kHz, until told */
+    sb_out(p, 0xAA);
+}
+
+/* How many bytes follow a command. */
+static int sb_args(uint8_t cmd)
+{
+    switch (cmd) {
+    case 0x10: case 0x40: case 0xE0: case 0xE4: return 1;
+    case 0x14: case 0x16: case 0x17: case 0x48: case 0x74: case 0x75:
+    case 0x76: case 0x77: case 0x80: case 0x91: return 2;
+    default: return 0;
+    }
+}
+
+static void sb_command(pc *p)
+{
+    uint32_t n = (uint32_t)p->sb.arg[0] | ((uint32_t)p->sb.arg[1] << 8);
+    switch (p->sb.cmd) {
+    case 0x10: p->sb.dac = p->sb.arg[0]; break;                 /* a sample, directly */
+    case 0x14: case 0x91:                                       /* a block, once */
+    case 0x16: case 0x17: case 0x74: case 0x75: case 0x76: case 0x77:
+    case 0x80:                                                  /* (compressed, or silence: as a block) */
+        p->sb.left = n + 1;
+        p->sb.autoinit = 0;
+        p->sb.active = 1;
+        p->sb.paused = 0;
+        break;
+    case 0x1C: case 0x90:                                       /* blocks, until told to stop */
+        p->sb.left = (uint32_t)p->sb.block + 1;
+        p->sb.autoinit = 1;
+        p->sb.active = 1;
+        p->sb.paused = 0;
+        break;
+    case 0x40: p->sb.tc = p->sb.arg[0]; break;
+    case 0x48: p->sb.block = (uint16_t)n; break;
+    case 0xD0: p->sb.paused = 1; break;
+    case 0xD4: p->sb.paused = 0; break;
+    case 0xD1: p->sb.speaker = 1; break;
+    case 0xD3: p->sb.speaker = 0; break;
+    case 0xD8: sb_out(p, p->sb.speaker ? 0xFF : 0x00); break;
+    case 0xDA: p->sb.autoinit = 0; break;                       /* stop at the block's end */
+    case 0xE0: sb_out(p, (uint8_t)~p->sb.arg[0]); break;
+    case 0xE1: sb_out(p, 2); sb_out(p, 1); break;               /* version 2.01 */
+    case 0xE4: p->sb.test = p->sb.arg[0]; break;
+    case 0xE8: sb_out(p, p->sb.test); break;
+    case 0xF2: p->sb.irq = 1; raise_irq(p, SB_IRQ); break;
+    case 0x20: sb_out(p, 0x80); break;                          /* nothing to record */
+    default: break;
+    }
+}
+
+static void sb_write(pc *p, uint16_t port, uint8_t v)
+{
+    if (port == 0x226) {
+        if ((p->sb.rst & 1) && !(v & 1))
+            sb_reset(p);
+        p->sb.rst = v;
+    } else if (port == 0x22C) {
+        if (p->sb.need == 0) {
+            p->sb.cmd = v;
+            p->sb.have = 0;
+            p->sb.need = (uint8_t)sb_args(v);
+            if (p->sb.need == 0)
+                sb_command(p);
+        } else {
+            p->sb.arg[p->sb.have++] = v;
+            if (p->sb.have == p->sb.need) {
+                p->sb.need = 0;
+                sb_command(p);
+            }
+        }
+    }
+}
+
+static uint8_t sb_read(pc *p, uint16_t port)
+{
+    switch (port) {
+    case 0x22A:
+        if (p->sb.out_n) {
+            p->sb.last = p->sb.out[0];
+            memmove(p->sb.out, p->sb.out + 1, 3);
+            p->sb.out_n--;
+        }
+        return p->sb.last;
+    case 0x22C: return 0x7F;                    /* always ready */
+    case 0x22E:
+        p->sb.irq = 0;
+        return (uint8_t)(p->sb.out_n ? 0xFF : 0x7F);
+    default: return 0xFF;
+    }
+}
+
+/* The DMA controller: channel 1 only. */
+static void dma_write(pc *p, uint16_t port, uint8_t v)
+{
+    switch (port) {
+    case 0x02:
+        if (p->dma.ff)
+            p->dma.base_addr = (uint16_t)((p->dma.base_addr & 0x00FF) | (v << 8));
+        else
+            p->dma.base_addr = (uint16_t)((p->dma.base_addr & 0xFF00) | v);
+        p->dma.addr = p->dma.base_addr;
+        p->dma.ff ^= 1;
+        break;
+    case 0x03:
+        if (p->dma.ff)
+            p->dma.base_count = (uint16_t)((p->dma.base_count & 0x00FF) | (v << 8));
+        else
+            p->dma.base_count = (uint16_t)((p->dma.base_count & 0xFF00) | v);
+        p->dma.count = p->dma.base_count;
+        p->dma.ff ^= 1;
+        break;
+    case 0x0A: if ((v & 3) == 1) p->dma.mask = (v >> 2) & 1; break;
+    case 0x0B: if ((v & 3) == 1) p->dma.mode = v; break;
+    case 0x0C: p->dma.ff = 0; break;
+    case 0x0D: p->dma.ff = 0; p->dma.mask = 1; p->dma.tc = 0; break;
+    case 0x0E: p->dma.mask = 0; break;
+    case 0x0F: p->dma.mask = (v >> 1) & 1; break;
+    case 0x83: p->dma.page = v; break;
+    default: break;
+    }
+}
+
+static uint8_t dma_read(pc *p, uint16_t port)
+{
+    uint8_t v = 0xFF;
+    switch (port) {
+    case 0x02:
+        v = (uint8_t)(p->dma.ff ? p->dma.addr >> 8 : p->dma.addr);
+        p->dma.ff ^= 1;
+        break;
+    case 0x03:
+        v = (uint8_t)(p->dma.ff ? p->dma.count >> 8 : p->dma.count);
+        p->dma.ff ^= 1;
+        break;
+    case 0x08:
+        v = (uint8_t)(p->dma.tc << 1);
+        p->dma.tc = 0;
+        break;
+    case 0x83: v = p->dma.page; break;
+    default: break;
+    }
+    return v;
+}
+
+/* Time passes: a sample is due every 256 - tc microseconds. */
+static void sb_advance(pc *p, uint32_t ticks)
+{
+    uint64_t period = (uint64_t)(256 - p->sb.tc) * 1193182u;
+    p->sb.frac += (uint64_t)ticks * 1000000u;
+    while (p->sb.frac >= period) {
+        p->sb.frac -= period;
+        if (p->sb.active && !p->sb.paused && !p->dma.mask) {
+            uint32_t a = ((uint32_t)p->dma.page << 16) | p->dma.addr;
+            p->sb.dac = a < PC_RAM_SIZE ? p->ram[a] : 0xFF;
+            p->sb.samples++;
+            p->dma.addr++;
+            if (p->dma.count-- == 0) {
+                p->dma.tc = 1;
+                if (p->dma.mode & 0x10) {
+                    p->dma.addr = p->dma.base_addr;
+                    p->dma.count = p->dma.base_count;
+                } else {
+                    p->dma.mask = 1;
+                }
+            }
+            if (--p->sb.left == 0) {
+                p->sb.irq = 1;
+                raise_irq(p, SB_IRQ);
+                if (p->sb.autoinit)
+                    p->sb.left = (uint32_t)p->sb.block + 1;
+                else
+                    p->sb.active = 0;
+            }
+        }
+        if (p->sb.wav)
+            fputc(p->sb.speaker ? p->sb.dac : 0x80, (FILE *)p->sb.wav);
     }
 }
 
@@ -455,7 +652,11 @@ static uint8_t port_read8(pc *p, uint16_t port)
     case 0x70: return p->cmos_index;
     case 0x71: return p->cmos[p->cmos_index & 0x7F];
     case 0x92: return (uint8_t)(p->a20 << 1);
-    case 0x388:
+    case 0x02: case 0x03: case 0x08: case 0x83:
+        return dma_read(p, port);
+    case 0x22A: case 0x22C: case 0x22E:
+        return sb_read(p, port);
+    case 0x228: case 0x388:
         return (uint8_t)(((p->opl.f1 || p->opl.f2) << 7) | (p->opl.f1 << 6) |
                          (p->opl.f2 << 5) | 0x06);
     case 0xE3: return mouse_read(p);
@@ -511,9 +712,29 @@ static void port_write8(pc *p, uint16_t port, uint8_t v)
         break;
     case 0xE3: p->mouse.seq = 0; break;
     case 0x1E1: p->hdmi = v & 1; break;     /* sound on the display's cable: no cable here */
+    /* A diagnostic ("POST") port: the code is kept, and printed if
+     * M86_POST is in the environment. test386.asm reports there. */
+    /* With M86_E9 in the environment, bytes written to port E9h go
+     * to standard output (test386.asm's results come out there). */
+    case 0xE9:
+        if (getenv("M86_E9"))
+            putchar(v);
+        break;
+    case 0x190:
+        p->post = v;
+        if (getenv("M86_POST"))
+            fprintf(stderr, "POST %02x\n", v);
+        break;
     case 0x1E0: p->slow = v; break;         /* the speed control: nothing to slow here */
-    case 0x388: p->opl.index = v; break;
-    case 0x389: opl_write(p, v); break;
+    case 0x02: case 0x03: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+    case 0x0E: case 0x0F: case 0x83:
+        dma_write(p, port, v);
+        break;
+    case 0x226: case 0x22C:
+        sb_write(p, port, v);
+        break;
+    case 0x228: case 0x388: p->opl.index = v; break;
+    case 0x229: case 0x389: opl_write(p, v); break;
     default:
         if (vga_port(port))
             vga_out(&p->vga, port, v);
@@ -571,6 +792,7 @@ void pc_init(pc *p)
     memset(p, 0, sizeof *p);
     p->ram = calloc(PC_RAM_SIZE, 1);
     memset(p->rom, 0xFF, sizeof p->rom);
+    p->rom_size = 0x10000;
     m86_init(&p->cpu);
     p->cpu.bus = p;
     p->cpu.mem_read = mem_read;
@@ -580,6 +802,13 @@ void pc_init(pc *p)
     p->cpu.irq_ack = irq_ack;
     p->conv_size = 0xA0000;
     p->insn_per_tick = 16;      /* about 19 MIPS against a 1.193 MHz timer */
+    p->dma.mask = 1;
+    p->sb.dac = 0x80;
+    p->sb.tc = 0xD2;
+    /* M86_WAV=file: what the Sound Blaster plays, as unsigned bytes,
+     * one for every sample period (raw, no header). */
+    if (getenv("M86_WAV"))
+        p->sb.wav = fopen(getenv("M86_WAV"), "wb");
 
     /* A fixed clock, so that runs are reproducible: 1990-01-01 12:00. */
     p->cmos[0x00] = bcd(0);
@@ -606,12 +835,13 @@ int pc_load_bios(pc *p, const char *path)
     FILE *f = fopen(path, "rb");
     if (!f)
         return -1;
-    uint8_t buf[0x10001];
+    static uint8_t buf[0x20001];
     size_t n = fread(buf, 1, sizeof buf, f);
     fclose(f);
-    if (n == 0 || n > 0x10000)
+    if (n == 0 || n > 0x20000)
         return -1;
-    memcpy(p->rom + 0x10000 - n, buf, n);
+    p->rom_size = n > 0x10000 ? 0x20000 : 0x10000;
+    memcpy(p->rom + 0x20000 - n, buf, n);
     return 0;
 }
 
@@ -639,6 +869,7 @@ void pc_devices(pc *p, uint32_t steps)
     if (p->pit_frac >= p->insn_per_tick) {
         pit_advance(p, p->pit_frac / p->insn_per_tick);
         opl_advance(p, p->pit_frac / p->insn_per_tick);
+        sb_advance(p, p->pit_frac / p->insn_per_tick);
         p->pit_frac %= p->insn_per_tick;
     }
     if (p->kb_wait > 0)

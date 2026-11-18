@@ -205,14 +205,14 @@ module `M86_TOP (
         .v_hsync(v_hs), .v_vsync(v_vs), .v_de(v_de),
         .uart_tx(UART0_TX), .uart_rx(UART0_RX),
         .sd_sck(SD_SCK), .sd_mosi(SD_MOSI), .sd_miso(SD_MISO), .sd_ss_n(SD_SS),
-        .spk(spk), .opl_we(opl_we), .opl_a(opl_a), .opl_d(opl_d),
+        .spk(spk), .sb_sample(sb_sample), .opl_we(opl_we), .opl_a(opl_a), .opl_d(opl_d),
         .halted(halted), .last_exc(last_exc), .tick18(tick18));
 
     // Sound: the PC speaker and the AdLib as 48,000 samples a second
     // on the optical output, by Zeitlos's S/PDIF transmitter, on the
     // 48 MHz oscillator (m86_spk.v says why that clock).
     wire        spk, opl_we, a_tick, a_frame;
-    wire [7:0]  opl_a, opl_d;
+    wire [7:0]  opl_a, opl_d, sb_sample;
     wire signed [15:0] a_sample;
     wire hdmi;
     reg  [7:0]  apor = 8'd0;
@@ -220,7 +220,7 @@ module `M86_TOP (
         if (!apor[7])
             apor <= apor + 8'd1;
     m86_audio audio (
-        .clk(clk), .opl_we(opl_we), .opl_a(opl_a), .opl_d(opl_d), .spk(spk),
+        .clk(clk), .opl_we(opl_we), .opl_a(opl_a), .opl_d(opl_d), .spk(spk), .sb(sb_sample),
         .aclk(CLK_48), .arst(!apor[7]),
         .tick(a_tick), .frame_req(a_frame), .sample(a_sample),
         .sd_l(), .sd_r());

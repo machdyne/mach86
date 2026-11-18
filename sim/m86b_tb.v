@@ -25,7 +25,7 @@ module m86b_tb;
         .clk(clk), .rst(rst),
         .d_req(d_req), .d_wr(d_wr), .d_addr(d_addr), .d_size(d_size),
         .d_wdata(d_wdata), .d_rdata(d_rdata), .d_ack(d_req),
-        .slow(8'd0), .d_st_rdy(1'b1), .d_io(), .irq(1'b0), .irq_vec(8'd0), .inta(), .step_done(),
+        .slow(8'd0), .dma_req(1'b0), .dma_addr(24'd0), .d_st_rdy(1'b1), .d_io(), .irq(1'b0), .irq_vec(8'd0), .inta(), .step_done(),
         .halted(halted), .last_exc(last_exc), .dbg_insns(dbg_insns));
 
     always @(posedge clk)

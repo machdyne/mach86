@@ -69,7 +69,9 @@ and recorded; that is done when the entry is first needed.
 | Wolfenstein 3D (shareware episode) | VGA, 286 instructions, AdLib, Sound Blaster | 4–5 | Shareware; to confirm |
 | Doom (shareware episode) | 386 protected mode, DOS extender, VGA, Sound Blaster | 6 | Shareware; to confirm |
 | Second Reality | 386, VGA, sound | 7 | Reported released to the public domain by its authors; to confirm |
-| A DPMI host and an expanded-memory manager | Paging, V86 | 7 | To choose; permissive or freely redistributable |
+| Jemm386 5.8x (github.com/Baron-von-Riedesel/Jemm) | An expanded-memory manager: virtual 8086 mode, paging, VCPI | 3 (round 29) | Artistic License in part (its `Readme.txt`, section 9). Source fetched and built with JWasm and JWlink (same author, also fetched); nothing committed |
+| test386.asm (github.com/barotto/test386.asm) | A test ROM for 386 emulators: all of protected mode | 3 (rounds 28, 29) | GPL 3. Fetched and assembled for testing; nothing committed |
+| A DPMI host | Paging, level 3 | 7 | To choose; permissive or freely redistributable |
 | Windows 3.x | Protected mode stress test, optional | 6–7 | Proprietary; user-supplied, never fetched |
 
 Games listed here are examples that mark a level of the machine, not a

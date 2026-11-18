@@ -30,8 +30,45 @@ UREP, UNREP, UREPNE, UNREPNE = 32, 33, 34, 35
 UA_NOT1 = 64
 # ... on CR0.PE, and on whether what is being delivered is a fault.
 UPE, UNPE, UFLT, UNFLT = 128, 129, 256, 257
+# ... and on what the protection logic knows (UPC: if so; UNPC: if not):
+# the selector being loaded is null and for a data segment; the segment
+# being loaded is CS; and of the descriptor last looked at: it passed,
+# is present, is marked accessed, is a system descriptor, and the
+# transfer changes level.
+P_NULL, P_CS, P_OK, P_P, P_A, P_SYS, P_LEVEL = range(1, 8)
+
+
+def UPC(n):
+    return 128 | n << 1
+
+
+def UNPC(n):
+    return 129 | n << 1
+
+
+# A second set, the same way (UPX, UNPX): in virtual 8086 mode; there
+# and outside the I/O privilege level; on the way out of it; at level
+# 0; in protected mode proper (PE set and not virtual 8086 mode).
+X_VM, X_VMS, X_VMINT, X_CPL0, X_PM = range(5)
+
+
+def UPX(n):
+    return 384 | n << 1
+
+
+def UNPX(n):
+    return 385 | n << 1
+
+
 # Special operations.
 NOP, SETSEG, READ, WRFL, FLBIT, RAISE, CHKCS, LEA = range(8)
+# A LOAD's aop: the place will be written by this instruction (with
+# paging the page is looked up as for a write). The assembler sets it
+# on the load of a read-modify-write by itself (mark_rmw).
+RMW = 8
+# ... or looked at ahead of a write that cannot be taken back (INS,
+# ENTER): the page is looked up as for the write itself.
+WPROBE = 12
 # Things READ reads.
 R_EIP, R_FLAGS, R_SEGSEL, R_NEXT, R_IMM, R_DISP, R_VEC, R_ESP0 = range(8)
 # ... of the system registers: where the descriptor of the selector
@@ -54,8 +91,28 @@ ISIZE = 3                       # the instruction's operand size
 # Immediate kinds.
 I_NONE, I_8, I_Z, I_16, I_S8, I_FAR, I_OFFS, I_ENTER = range(8)
 
-words = []
+# The ROM has two halves of 1,024 words. Opcodes start in the lower
+# (the attribute ROM's entry field is ten bits); routines that are only
+# ever jumped to can be put in the upper, between upper() and lower().
+words_lo, words_hi = [], []
+words = words_lo
+UPPER = 1024
 labels = {}
+
+
+def upper():
+    global words
+    words = words_hi
+
+
+def lower():
+    global words
+    words = words_lo
+
+
+def here_addr():
+    return len(words) + (UPPER if words is words_hi else 0)
+
 attr = [0] * 1024
 
 
@@ -65,6 +122,8 @@ def u(a=0, b=0, c=0, d=None, size=2, unit=ALU, aop=0, fm=0, seg=0, scale=0,
       selcc=0, hi=0, selseg=0, asz=0, a16as=0, ssz=0):
     """One microcode ROM word."""
     assert not (usek and jmp is not None), 'k is the constant or the target'
+    assert not (isinstance(jmp, int) and words is words_hi and jmp < UPPER), \
+        'a numbered jump in the upper half must be an address there'
     d_we = 0 if d is None else 1
     # An access to the stack: the offset is SP or ESP, as the stack
     # segment says, and so is a size given with ssz.
@@ -84,7 +143,7 @@ def u(a=0, b=0, c=0, d=None, size=2, unit=ALU, aop=0, fm=0, seg=0, scale=0,
 
 
 def label(name):
-    labels[name] = len(words)
+    labels[name] = here_addr()
 
 
 def org(addr):
@@ -99,6 +158,7 @@ def at(opcodes, modrm=0, imm=I_NONE, byte=0, mem=None, group=0, rel=0,
     mem: None for instructions without ModRM; False for the register
     form, True for the memory form.
     """
+    assert words is words_lo, 'opcodes start in the lower half'
     entry = len(words)
     if byte is PAIR:
         (lo, hi), = opcodes
@@ -176,10 +236,8 @@ label('pmseg')
 # second is in T7 for the SETSEG that ends this, which does the load
 # and goes back to where the first SETSEG would have gone on. T7 is
 # used by nothing that loads a segment.
-u(unit=SPEC, aop=READ, b=R_DESC, d=T7)
-u(unit=LOAD, a=T7, seg=FLAT, size=2)
-u(unit=LOAD, a=T7, disp=1, usek=1, k=4, seg=FLAT, d=T7, size=2)
-u(unit=SPEC, aop=SETSEG, a=T7)
+u(unit=SPEC, aop=NOP, jmp='pmseg_cs', ucc=UPC(P_CS))
+u(unit=SPEC, aop=READ, b=R_DESC, d=T7, jmp='pmseg_d')
 assert len(words) <= 32
 
 org(32)
@@ -368,11 +426,15 @@ for ops, m in [([0x07, 0x17, 0x1F], 0), ([0xA1, 0xA9], 1)]:
 # ---------------------------------------------------------------------
 # Flags register
 
+# (PUSHF and POPF fault in virtual 8086 mode outside the I/O privilege
+# level, as INT n and IRET do: a word each to ask.)
 at([0x9C])                                              # PUSHF
-u(unit=STORE, a=ESP, aop=ST_READ, b=R_FLAGS, seg=SS, a16=1, aupd=1,
-  size=ISIZE, end=1)
+u(unit=SPEC, aop=READ, b=R_FLAGS, d=T1)
+u(unit=SPEC, aop=NOP, jmp='vm_gp', ucc=UPX(X_VMS))
+u(unit=STORE, a=ESP, c=T1, seg=SS, a16=1, aupd=1, size=ISIZE, end=1)
 at([0x9D])                                              # POPF
 u(unit=LOAD, a=ESP, seg=SS, a16=1, aupd=1, d=T1, size=ISIZE)
+u(unit=SPEC, aop=NOP, jmp='vm_gp', ucc=UPX(X_VMS))
 u(unit=SPEC, aop=WRFL, a=T1, size=ISIZE, usek=1, k=-1, end=1)
 at([0x9E])                                              # SAHF
 u(unit=SPEC, aop=WRFL, a=EAX, hi=H_A, size=0, usek=1, k=0xD5, end=1)
@@ -465,14 +527,19 @@ def far_pointer_from_memory():
     u(unit=LOAD, a=T5, selseg=SEG_EA, d=T3, size=1)
 
 
+label('retf_go')
+u(unit=SPEC, aop=NOP, jmp='pm_retf', ucc=UPX(X_PM))
 label('farjmp')
-# Jump to T3:T2. The offset is checked before CS changes.
-u(unit=ALU, aop=OR, a=ZERO, b=T2, d=T2, size=ISIZE)
+# Jump to T3:T2. The offset is checked before CS changes. (With PE set
+# all of this is elsewhere: pm_farjmp and the rest, further down.)
+u(unit=ALU, aop=OR, a=ZERO, b=T2, d=T2, size=ISIZE, jmp='pm_farjmp', ucc=UPX(X_PM))
+label('far_go')
 u(unit=SPEC, aop=CHKCS, a=T2, size=ISIZE)
 u(unit=SPEC, aop=SETSEG, a=T3, seg=CS, size=1)
+label('far_jump')
 u(unit=ALU, aop=OR, a=ZERO, b=T2, d=T2, br=3, end=1)
 label('farcall')
-u(unit=SPEC, aop=READ, b=R_SEGSEL, seg=CS, d=T4)
+u(unit=SPEC, aop=READ, b=R_SEGSEL, seg=CS, d=T4, jmp='pm_farcall', ucc=UPX(X_PM))
 push(T4)
 u(unit=SPEC, aop=READ, b=R_NEXT, d=T4)
 push(T4, jmp='farjmp')
@@ -491,15 +558,18 @@ u(unit=SPEC, aop=READ, b=R_IMM, d=T2)
 u(unit=SPEC, aop=READ, b=R_DISP, d=T3, jmp='farcall')
 at([0xCB])                                              # RETF
 pop(T2)
-pop(T3, jmp='farjmp')
+pop(T3, jmp='retf_go')
 at([0xCA], imm=I_16)                                    # RETF imm16
 pop(T2)
 pop(T3)
-u(unit=ALUI, aop=ADD, a=ESP, d=ESP, ssz=1, jmp='farjmp')
+u(unit=ALUI, aop=ADD, a=ESP, d=ESP, ssz=1, jmp='retf_go')
 at([0xCF])                                              # IRET
 pop(T2)
 pop(T3)
+u(unit=ALU, aop=OR, a=ZERO, b=ZERO, d=T6)               # (the flags' upper half, if they are 16 bits)
 pop(T6)
+u(unit=SPEC, aop=NOP, jmp='pm_iret', ucc=UPE)
+label('iret_go')
 u(unit=SPEC, aop=CHKCS, a=T2, size=ISIZE)
 u(unit=SPEC, aop=SETSEG, a=T3, seg=CS, size=1)
 u(unit=SPEC, aop=WRFL, a=T6, size=ISIZE, usek=1, k=-1)
@@ -507,6 +577,7 @@ u(unit=SPEC, aop=NOP, c=T2, size=ISIZE, br=7, cc=J_REG, end=1)
 
 at([0xCD], imm=I_8)                                     # INT n
 u(unit=SPEC, aop=READ, b=R_NEXT, d=T4)
+u(unit=SPEC, aop=NOP, jmp='vm_gp', ucc=UPX(X_VMS))      # (virtual 8086 mode, outside the I/O level)
 u(unit=ALUI, aop=OR, a=ZERO, d=T1, jmp='int')
 at([0xCC])                                              # INT3
 u(unit=SPEC, aop=READ, b=R_NEXT, d=T4)
@@ -942,7 +1013,10 @@ u(unit=LOAD, a=EDX, seg=IO, a16=1, d=EAX, size=ISIZE, end=1)
 at([(0xEE, 0xEF)], byte=PAIR)
 u(unit=STORE, a=EDX, seg=IO, a16=1, c=EAX, size=ISIZE, end=1)
 PORT = dict(a=EDX, seg=IO, a16=1, size=ISIZE)
-string_op(0x6C, [dict(PORT, unit=LOAD, d=T1),                       # INS
+# (INS looks at where it will store before it reads the port: with
+# paging, a fault after the read would lose what the port gave.)
+string_op(0x6C, [dict(DST, unit=LOAD, aop=WPROBE),                     # INS
+                 dict(PORT, unit=LOAD, d=T1),
                  dict(DST, unit=STORE, c=T1), NEXT_DI])
 string_op(0x6E, [dict(SRC, d=T1),                                   # OUTS
                  dict(PORT, unit=STORE, c=T1), NEXT_SI])
@@ -963,9 +1037,10 @@ at([0x61])                                              # POPA
 for r in (EDI, ESI, EBP, T1, EBX, EDX, ECX):
     pop(r)
 pop(EAX)
-# ESP is not restored, but with a 32-bit operand its upper half takes
-# the stored value (observed on hardware).
-u(unit=ALU, aop=OR, a=ZERO, b=ESP, d=T1, size=1)
+# ESP is not restored, but with a 32-bit operand and a 16-bit stack
+# its upper half takes the stored value (observed on hardware). With
+# a 32-bit stack all of ESP is the stack pointer, and stays.
+u(unit=ALU, aop=OR, a=ZERO, b=ESP, d=T1, ssz=1)
 u(unit=ALU, aop=OR, a=ZERO, b=T1, d=ESP, size=ISIZE, end=1)
 
 at([0xC8], imm=I_ENTER)                                 # ENTER
@@ -985,6 +1060,10 @@ push(T6, jmp='enter_loop')
 label('enter_last')
 push(T1)
 label('enter_done')
+# (Where the stack pointer will end up must be writable: with paging,
+# that is where ENTER takes its page fault.)
+u(unit=ALUI, aop=SUB, a=ESP, d=T3, ssz=1)
+u(unit=LOAD, a=T3, seg=SS, a16=1, aop=WPROBE, size=0)
 u(unit=ALU, aop=OR, a=ZERO, b=T1, d=EBP, size=ISIZE)
 u(unit=ALUI, aop=SUB, a=ESP, d=ESP, ssz=1, end=1)
 
@@ -1090,7 +1169,7 @@ u(unit=SPEC, aop=LEA, ea=1, d=T5, jmp='lidt')
 u(unit=SPEC, aop=READ, b=R_CR0, d=T1, jmp='mov_m16')    # SMSW m16
 invalid()
 u(unit=LOAD, ea=1, d=T1, size=1, jmp='lmsw_t1')         # LMSW m16
-u(unit=SPEC, aop=NOP, end=1)                            # INVLPG (a 486's): no paging yet
+u(unit=SPEC, aop=NOP, cc=14, b=5, end=1)                # INVLPG (a 486's): the whole buffer goes
 label('lmsw_t1')
 u(unit=SPEC, aop=NOP, a=T1, cc=W_MSW, end=1)
 for name, lim, base in (('sgdt', R_GDTL, R_GDTB), ('sidt', R_IDTL, R_IDTB)):
@@ -1133,56 +1212,19 @@ at([0x08, 0x09], map0f=1)                               # INVD, WBINVD: no cache
 label('nop_end')
 u(unit=SPEC, aop=NOP, end=1)
 
-# SHLD and SHRD: the destination shifted, the bits the source gives
-# OR-ed in (the shifter's "other half"). The destination is copied to
-# T1 first, the count to T3, and T7 says whether the result goes to a
-# register (1) or back to memory (0), so that one routine serves both.
-# Nothing happens with a count of zero. With 16-bit operands and more
-# than 16 places the hardware goes on shifting and the source comes
-# round again: the result is the source rotated.
-OFLAG_AB = 10                   # FLBIT: overflow if A's sign is not B's
+# SHLD and SHRD: the shifter's kinds 2 and 3, a uop like any shift
+# (register A shifted, register C's bits coming in).
 for right, op_imm, op_cl in [(0, 0xA4, 0xA5), (1, 0xAC, 0xAD)]:
-    name = 'shd%d' % right
-    at([op_imm], modrm=1, imm=I_8, mem=False, map0f=1)
-    u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=ISIZE)
-    u(unit=ALUI, aop=OR, a=ZERO, d=T7, usek=1, k=1)
-    u(unit=ALUI, aop=OR, a=ZERO, d=T3, size=0, jmp=name)
-    at([op_cl], modrm=1, mem=False, map0f=1)
-    u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=ISIZE)
-    u(unit=ALUI, aop=OR, a=ZERO, d=T7, usek=1, k=1)
-    u(unit=ALU, aop=OR, a=ZERO, b=ECX, d=T3, size=0, jmp=name)
-    at([op_imm], modrm=1, imm=I_8, mem=True, map0f=1)
-    u(unit=LOAD, ea=1, d=T1, size=ISIZE)
-    u(unit=ALUI, aop=OR, a=ZERO, d=T3, size=0)
-    u(unit=ALU, aop=OR, a=ZERO, b=ZERO, d=T7, jmp=name)
-    at([op_cl], modrm=1, mem=True, map0f=1)
-    u(unit=LOAD, ea=1, d=T1, size=ISIZE)
-    u(unit=ALU, aop=OR, a=ZERO, b=ECX, d=T3, size=0)
-    u(unit=ALU, aop=OR, a=ZERO, b=ZERO, d=T7, jmp=name)
-    label(name)
-    u(unit=ALUI, aop=AND, a=T3, d=T3, size=0, usek=1, k=31)
-    u(unit=SPEC, aop=NOP, jmp='nop_end', ucc=UZ)
-    u(unit=SPEC, aop=BITS, d=T5, size=ISIZE)
-    u(unit=ALUI, aop=AND, a=T5, d=T5, usek=1, k=16)
-    u(unit=ALU, aop=AND, a=T3, b=T5, d=T6)
-    u(unit=SPEC, aop=NOP, jmp=name + '_n', ucc=UZ)
-    u(unit=ALUI, aop=AND, a=T3, d=T6, usek=1, k=15)
-    u(unit=SPEC, aop=NOP, jmp=name + '_n', ucc=UZ)
-    u(unit=SPEC, aop=WRFL, a=ZERO, usek=1, k=AFLAG)
-    u(unit=SHIFT, aop=right, sela=REG, b=T3, cc=1, d=T2, size=ISIZE, fm=1,
-      jmp=name + '_f')
-    label(name + '_n')
-    u(unit=SHIFT, aop=4 + right, a=T1, b=T3, cc=1, d=T2, size=ISIZE, fm=1)
-    u(unit=SHIFT, aop=2 + right, sela=REG, b=T3, cc=1, d=T4, size=ISIZE)
-    u(unit=ALU, aop=OR, a=T2, b=T4, d=T2, size=ISIZE)
-    label(name + '_f')
-    u(unit=SPEC, aop=FLBIT, cc=OFLAG_AB, a=T2, b=T1, size=ISIZE)
-    u(unit=SPEC, aop=SZP, a=T2, size=ISIZE)
-    u(unit=ALU, aop=OR, a=T7, b=ZERO, d=T7)
-    u(unit=SPEC, aop=NOP, jmp=name + '_m', ucc=UZ)
-    u(unit=ALU, aop=OR, a=ZERO, b=T2, seld=RM, d=0, size=ISIZE, end=1)
-    label(name + '_m')
-    u(unit=STORE, cc=2, c=T2, size=ISIZE, end=1)
+    for op, kw in ((op_imm, dict()), (op_cl, dict(b=ECX, cc=1))):
+        imm = I_8 if op == op_imm else I_NONE
+        at([op], modrm=1, imm=imm, mem=False, map0f=1)
+        u(unit=SHIFT, aop=2 + right, sela=RM, selc=REG, seld=RM, d=0,
+          size=ISIZE, fm=1, end=1, **kw)
+        at([op], modrm=1, imm=imm, mem=True, map0f=1)
+        u(unit=LOAD, ea=1, d=T1, size=ISIZE)
+        u(unit=SHIFT, aop=2 + right, a=T1, selc=REG, d=T1, size=ISIZE, fm=1,
+          **kw)
+        u(unit=STORE, cc=2, c=T1, size=ISIZE, end=1)
 
 # BT, BTS, BTR, BTC. The ALU has the bit operations (13 set, 14 clear,
 # 15 turn over; the carry is the bit as it was), and operation
@@ -1220,12 +1262,14 @@ for r in range(8):
         invalid()
     else:
         u(unit=LOAD, ea=1, d=T1, size=ISIZE, jmp='btm%d' % r)
+upper()
 label('btm4')
 u(unit=ALUI, aop=BSET, a=T1, size=ISIZE, fm=3, end=1)
 for r in (5, 6, 7):
     label('btm%d' % r)
     u(unit=ALUI, aop=BSET if r == 5 else r + 8, a=T1, d=T1, size=ISIZE, fm=3)
     u(unit=STORE, cc=2, c=T1, size=ISIZE, end=1)
+lower()
 
 # BSWAP: by halves. The register turned by 16, its lower half's bytes
 # exchanged, is the result's lower half; the register's own lower
@@ -1267,46 +1311,406 @@ u(unit=ALU, aop=OR, a=ZERO, b=T1, d=EAX, size=ISIZE, end=1)
 
 
 # ---------------------------------------------------------------------
-# Protected mode, the second part.
+# Protected mode, the second part and the third (privilege levels).
 
-# An interrupt or fault with PE set: T1 the vector, T4 the return
-# address, T5 the IDT's base. Through a gate to the same privilege
-# level; nothing is checked. A 32-bit gate pushes doublewords; an
-# interrupt gate clears IF; a fault of 8 to 15 pushes an error code,
-# always zero.
 W_LDT, W_LDTB, W_TR = 10, 11, 12
 TF_OFF = 14                     # FLBIT
+upper()
+
+
+def lookup(sel, lo, hi):
+    """The descriptor a selector names: its halves into lo and hi (T7
+    is used; hi may be T7)."""
+    u(unit=SPEC, aop=NOP, a=sel, cc=W_SEL)
+    u(unit=SPEC, aop=READ, b=R_DESC, d=T7)
+    if lo is not None:
+        u(unit=LOAD, a=T7, seg=FLAT, d=lo)
+    u(unit=LOAD, a=T7, disp=1, usek=1, k=4, seg=FLAT, d=hi)
+
+
+def check(kind, hi, lo=ZERO):
+    """Have the core look at a descriptor (K_ kinds); the P_ conditions
+    then say what it found."""
+    u(unit=SPEC, aop=READ, b=R_DESC, cc=kind, a=hi, c=lo)
+
+
+def unless_ok(gp, np):
+    u(unit=SPEC, aop=NOP, jmp=gp, ucc=UNPC(P_OK))
+    u(unit=SPEC, aop=NOP, jmp=np, ucc=UNPC(P_P))
+
+
+def push_n(reg, size):
+    u(unit=STORE, a=ESP, c=reg, seg=SS, a16=1, aupd=1, size=size)
+
+
+def tss_stack(esp, ss, tag):
+    """The stack of the level being gone to, from the task state
+    segment: a 386's (doubleword pointer, then the selector) or a
+    286's (two words)."""
+    u(unit=SPEC, aop=NOP)                               # (the address is a cycle behind the level)
+    u(unit=SPEC, aop=READ, b=R_DESC, cc=R_TSSSP, d=T7)
+    u(unit=LOAD, a=T7, seg=FLAT, d=esp)
+    u(unit=SPEC, aop=NOP, jmp=tag + '_32', ucc=UPC(P_OK))
+    u(unit=SHIFT, aop=5, a=esp, d=ss, usek=1, k=16)
+    u(unit=SHIFT, aop=4, a=esp, d=esp, usek=1, k=16)
+    u(unit=SHIFT, aop=5, a=esp, d=esp, usek=1, k=16)
+    u(unit=SPEC, aop=NOP, jmp=tag + '_d')
+    label(tag + '_32')
+    u(unit=LOAD, a=T7, disp=1, usek=1, k=4, seg=FLAT, d=ss, size=1)
+    label(tag + '_d')
+
+
+def drop_segments():
+    """Back at an outer level: data segments it may not have are emptied."""
+    for seg in (ES, DS, FS, GS):
+        u(unit=SPEC, aop=SETSEG, a=ZERO, seg=seg, cc=2, size=1)
+
+
+# The kinds of look at a descriptor (READ of R_DESC with a cc; 1 to 3
+# are VERR/VERW, LAR and LSL), and the other things read that way.
+K_SEG, K_STACK, K_CODE, K_GCALL, K_GJMP, K_RET, K_CGATE, K_IGATE = range(4, 12)
+R_ERR, R_TSSSP, R_OSTK, R_SSPREV = 12, 13, 14, 15
+W_SEL, W_PROT, W_TRB = 13, 14, 15
+TPL_DPL, TPL_RPL, ERR_SEL, ERR_A = 1, 2, 3, 4          # W_PROT's B field
+VM_LOAD, VM_ON, VM_OFF = 6, 7, 8
+ST_ACC = 6                                              # a STORE of the type byte, accessed
+
+# A segment load with PE set (from 'pmseg'). The descriptor is read
+# (the core keeps the halves), looked at by the rule of the register
+# being loaded, marked accessed if it was not, and the SETSEG that ends
+# this does the load. A null selector empties a data segment. CS is
+# loaded by the far transfers, which have looked already.
+label('pmseg_d')
+u(unit=SPEC, aop=NOP, jmp='pmseg_null', ucc=UPC(P_NULL))
+u(unit=LOAD, a=T7, seg=FLAT)
+u(unit=LOAD, a=T7, disp=1, usek=1, k=4, seg=FLAT)
+u(unit=SPEC, aop=READ, b=R_DESC, cc=K_SEG)
+unless_ok('pmseg_gp', 'pmseg_np')
+label('pmseg_acc')
+u(unit=SPEC, aop=NOP, jmp='pmseg_fin', ucc=UPC(P_A))
+u(unit=STORE, a=T7, disp=1, usek=1, k=5, seg=FLAT, aop=ST_READ, b=ST_ACC, size=0)
+label('pmseg_fin')
+u(unit=SPEC, aop=SETSEG)
+label('pmseg_null')
+u(unit=SPEC, aop=SETSEG, cc=1)
+label('pmseg_cs')
+u(unit=SPEC, aop=READ, b=R_DESC, d=T7)
+u(unit=LOAD, a=T7, seg=FLAT)
+u(unit=LOAD, a=T7, disp=1, usek=1, k=4, seg=FLAT)
+u(unit=SPEC, aop=READ, b=R_DESC, cc=K_SEG, jmp='pmseg_acc')
+label('pmseg_gp')
+label('gp_sel')
+u(unit=SPEC, aop=NOP, cc=W_PROT, b=ERR_SEL)
+u(unit=SPEC, aop=RAISE, cc=1, usek=1, k=13, end=1)
+label('pmseg_np')                                       # (the core makes it 12 for SS)
+label('np_sel')
+u(unit=SPEC, aop=NOP, cc=W_PROT, b=ERR_SEL)
+u(unit=SPEC, aop=RAISE, cc=1, usek=1, k=11, end=1)
+label('ts_sel')
+u(unit=SPEC, aop=NOP, cc=W_PROT, b=ERR_SEL)
+u(unit=SPEC, aop=RAISE, cc=1, usek=1, k=10, end=1)
+label('ss_sel')
+u(unit=SPEC, aop=NOP, cc=W_PROT, b=ERR_SEL)
+u(unit=SPEC, aop=RAISE, cc=1, usek=1, k=12, end=1)
+
+# Far jump to T3:T2 with PE set: to a code segment of this level (or a
+# conforming one), or through a call gate.
+label('pm_farjmp')
+lookup(T3, T5, T6)
+check(K_CODE, T6, T5)
+u(unit=SPEC, aop=NOP, jmp='pm_jmp_gate', ucc=UPC(P_SYS))
+unless_ok('gp_sel', 'np_sel')
+u(unit=SPEC, aop=NOP, jmp='far_go')
+
+
+def gate_target(tag):
+    """T3:T2 = where the call gate in T6:T5 leads. Falls through with a
+    386 gate; goes to tag with a 286 gate, T3 not yet set."""
+    u(unit=ALUI, aop=AND, a=T6, hi=H_A, d=T4, size=0, usek=1, k=8)
+    u(unit=SPEC, aop=NOP, jmp=tag, ucc=UZ)
+    u(unit=ALU, aop=OR, a=ZERO, b=T6, d=T2)
+    u(unit=ALU, aop=OR, a=ZERO, b=T5, d=T2, size=1)
+
+
+label('pm_jmp_gate')
+check(K_CGATE, T6)
+unless_ok('gp_sel', 'np_sel')
+gate_target('pm_jg16')
+u(unit=SPEC, aop=NOP, jmp='pm_jg')
+label('pm_jg16')
+u(unit=ALU, aop=OR, a=ZERO, b=ZERO, d=T2)
+u(unit=ALU, aop=OR, a=ZERO, b=T5, d=T2, size=1)
+label('pm_jg')
+u(unit=SHIFT, aop=5, a=T5, d=T3, usek=1, k=16)
+lookup(T3, T5, T6)
+check(K_GJMP, T6, T5)
+unless_ok('gp_sel', 'np_sel')
+label('far_go32')
+u(unit=SPEC, aop=CHKCS, a=T2)
+label('far_set32')
+u(unit=SPEC, aop=SETSEG, a=T3, seg=CS, size=1)
+u(unit=SPEC, aop=NOP, c=T2, br=7, cc=J_REG, end=1)
+
+# Far call. Through a call gate to an inner level the stack changes:
+# the new one from the task state segment, the old stack pointer,
+# the parameters the gate counts, copied from the old stack, then the
+# return address, pushed on it.
+label('pm_farcall')
+lookup(T3, T5, T6)
+check(K_CODE, T6, T5)
+u(unit=SPEC, aop=NOP, jmp='pm_call_gate', ucc=UPC(P_SYS))
+unless_ok('gp_sel', 'np_sel')
+u(unit=SPEC, aop=CHKCS, a=T2, size=ISIZE)
+u(unit=SPEC, aop=READ, b=R_SEGSEL, seg=CS, d=T4)
+push(T4)
+u(unit=SPEC, aop=READ, b=R_NEXT, d=T4)
+push(T4)
+u(unit=SPEC, aop=SETSEG, a=T3, seg=CS, size=1, jmp='far_jump')
+label('pm_call_gate')
+check(K_CGATE, T6)
+unless_ok('gp_sel', 'np_sel')
+gate_target('pm_cg16')
+for size, name in ((2, 'pm_cg32'), (1, 'pm_cg16')):
+    if size == 1:
+        label('pm_cg16')
+        u(unit=ALU, aop=OR, a=ZERO, b=ZERO, d=T2)
+        u(unit=ALU, aop=OR, a=ZERO, b=T5, d=T2, size=1)
+    u(unit=SHIFT, aop=5, a=T5, d=T3, usek=1, k=16)
+    u(unit=ALUI, aop=AND, a=T6, d=T1, usek=1, k=31)     # how many parameters
+    lookup(T3, T5, T6)
+    check(K_GCALL, T6, T5)
+    unless_ok('gp_sel', 'np_sel')
+    u(unit=SPEC, aop=NOP, jmp=name + '_in', ucc=UPC(P_LEVEL))
+    u(unit=SPEC, aop=CHKCS, a=T2)
+    u(unit=SPEC, aop=READ, b=R_SEGSEL, seg=CS, d=T4)
+    push_n(T4, size)
+    u(unit=SPEC, aop=READ, b=R_NEXT, d=T4)
+    push_n(T4, size)
+    u(unit=SPEC, aop=NOP, jmp='far_set32')
+    label(name + '_in')
+    u(unit=SPEC, aop=NOP, a=T6, cc=W_PROT, b=TPL_DPL)
+    tss_stack(T4, T5, name)
+    lookup(T5, None, T7)
+    check(K_STACK, T7)
+    unless_ok('ts_sel', 'ss_sel')
+    u(unit=SPEC, aop=READ, b=R_DESC, cc=R_OSTK, d=T6)   # where the caller's stack is
+    u(unit=SPEC, aop=SETSEG, a=T5, seg=SS, size=1)
+    u(unit=ALU, aop=OR, a=ZERO, b=T4, d=ESP, ssz=1)
+    u(unit=SPEC, aop=READ, b=R_DESC, cc=R_SSPREV, d=T7)
+    push_n(T7, size)
+    u(unit=SPEC, aop=READ, b=R_ESP0, d=T7)
+    push_n(T7, size)
+    # The parameters, the last first, so that they lie as they lay.
+    u(unit=ALU, aop=OR, a=T1, b=ZERO, d=T1)
+    u(unit=SPEC, aop=NOP, jmp=name + '_np', ucc=UZ)
+    u(unit=SHIFT, aop=4, a=T1, d=T4, usek=1, k=size)
+    u(unit=ALU, aop=ADD, a=T6, b=T4, d=T4)
+    label(name + '_par')
+    u(unit=ALUI, aop=SUB, a=T4, d=T4, usek=1, k=2 * size)
+    u(unit=LOAD, a=T4, seg=FLAT, d=T7, size=size)
+    push_n(T7, size)
+    u(unit=ALU, aop=DEC, a=T1, d=T1, jmp=name + '_par', ucc=UA_NOT1)
+    label(name + '_np')
+    u(unit=SPEC, aop=READ, b=R_SEGSEL, seg=CS, d=T7)
+    push_n(T7, size)
+    u(unit=SPEC, aop=READ, b=R_NEXT, d=T7)
+    push_n(T7, size)
+    u(unit=SPEC, aop=NOP, jmp='far_go32')
+
+# Far return to T3:T2 (the stack pointer is already past them and the
+# parameters). To an outer level the stack pointer of that level is
+# next on this stack.
+label('pm_retf')
+lookup(T3, T5, T6)
+check(K_RET, T6, T5)
+unless_ok('gp_sel', 'np_sel')
+u(unit=SPEC, aop=NOP, jmp='far_go', ucc=UNPC(P_LEVEL))
+u(unit=SPEC, aop=NOP, a=T3, cc=W_PROT, b=TPL_RPL)
+pop(T4)
+pop(T5)
+lookup(T5, None, T7)
+check(K_STACK, T7)
+unless_ok('gp_sel', 'ss_sel')
+u(unit=SPEC, aop=CHKCS, a=T2, size=ISIZE)
+u(unit=SPEC, aop=SETSEG, a=T3, seg=CS, size=1)
+u(unit=SPEC, aop=SETSEG, a=T5, seg=SS, size=1)
+u(unit=ALU, aop=OR, a=ZERO, b=T4, d=ESP, size=ISIZE)
+u(unit=ALUI, aop=ADD, a=ESP, d=ESP, ssz=1)             # RETF n drops them there too
+drop_segments()
+u(unit=SPEC, aop=NOP, jmp='far_jump')
+
+# IRET with PE set: T3:T2 and the flags in T6. The flags go in while
+# the level is still the handler's (it decides what may change).
+label('pm_iret')
+u(unit=SPEC, aop=NOP, jmp='iret_vm', ucc=UPX(X_VM))
+u(unit=SHIFT, aop=5, a=T6, d=T7, usek=1, k=17)          # VM in the flags popped ...
+u(unit=ALUI, aop=AND, a=T7, d=T7, usek=1, k=1)
+u(unit=SPEC, aop=NOP, jmp='pm_iret_pm', ucc=UZ)
+u(unit=SPEC, aop=NOP, jmp='iret_to_vm', ucc=UPX(X_CPL0))    # ... counts at level 0 only
+label('pm_iret_pm')
+lookup(T3, T5, T1)
+check(K_RET, T1, T5)
+unless_ok('gp_sel', 'np_sel')
+u(unit=SPEC, aop=NOP, jmp='iret_go', ucc=UNPC(P_LEVEL))
+u(unit=SPEC, aop=NOP, a=T3, cc=W_PROT, b=TPL_RPL)
+pop(T4)
+pop(T5)
+lookup(T5, None, T7)
+check(K_STACK, T7)
+unless_ok('gp_sel', 'ss_sel')
+u(unit=SPEC, aop=CHKCS, a=T2, size=ISIZE)
+u(unit=SPEC, aop=WRFL, a=T6, size=ISIZE, usek=1, k=-1)
+u(unit=SPEC, aop=SETSEG, a=T3, seg=CS, size=1)
+u(unit=SPEC, aop=SETSEG, a=T5, seg=SS, size=1)
+u(unit=ALU, aop=OR, a=ZERO, b=T4, d=ESP, size=ISIZE)
+drop_segments()
+u(unit=SPEC, aop=NOP, c=T2, size=ISIZE, br=7, cc=J_REG, end=1)
+
+# IRET inside virtual 8086 mode: real mode's, if the I/O privilege
+# level allows it at all.
+label('iret_vm')
+u(unit=SPEC, aop=NOP, jmp='vm_gp', ucc=UPX(X_VMS))
+u(unit=SPEC, aop=NOP, jmp='iret_go')
+label('vm_gp')
+u(unit=SPEC, aop=RAISE, usek=1, k=13, end=1)
+# IRET from level 0 into virtual 8086 mode: the stack pointer and all
+# six segment registers come off the stack too; the segments are
+# loaded as real mode's.
+label('iret_to_vm')
+pop(T4)
+pop(T5)
+pop(T1)
+pop(T7)
+u(unit=SPEC, aop=NOP, cc=W_PROT, b=VM_LOAD)
+u(unit=SPEC, aop=WRFL, a=T6, size=ISIZE, usek=1, k=-1)
+u(unit=SPEC, aop=SETSEG, a=T1, seg=ES, size=1)
+u(unit=SPEC, aop=SETSEG, a=T7, seg=DS, size=1)
+pop(T1)
+pop(T7)
+u(unit=SPEC, aop=SETSEG, a=T1, seg=FS, size=1)
+u(unit=SPEC, aop=SETSEG, a=T7, seg=GS, size=1)
+u(unit=SPEC, aop=SETSEG, a=T5, seg=SS, size=1)
+u(unit=ALU, aop=OR, a=ZERO, b=T4, d=ESP)
+u(unit=SPEC, aop=SETSEG, a=T3, seg=CS, size=1)
+u(unit=SPEC, aop=NOP, cc=W_PROT, b=VM_ON)
+u(unit=ALU, aop=OR, a=ZERO, b=T2, d=T2, size=1, br=3, a16=1, end=1)
+
+# An interrupt or fault with PE set: T1 the vector, T4 the return
+# address, T5 the IDT's base. Through an interrupt or trap gate, 286's
+# or 386's, to the same level or (with the stack the task state
+# segment gives) an inner one. A fault of 8 to 15 pushes its error
+# code. Task gates are not here.
 label('int_pm')
 u(unit=LOAD, a=T5, b=T1, idx=1, scale=3, seg=FLAT, d=T2)
 u(unit=LOAD, a=T5, b=T1, idx=1, scale=3, disp=1, usek=1, k=4, seg=FLAT, d=T3)
+check(K_IGATE, T3)
+unless_ok('int_gp', 'int_np')
 u(unit=ALUI, aop=AND, a=T3, hi=H_A, d=T6, size=0, usek=1, k=8)
 u(unit=SPEC, aop=NOP, jmp='int_pm16', ucc=UZ)
 for size, name in ((2, 'int_pm32'), (1, 'int_pm16')):
-    if size == 1:
+    if size == 2:
+        u(unit=ALU, aop=OR, a=ZERO, b=T3, d=T6)         # the offset's upper half
+    else:
         label('int_pm16')
+        u(unit=ALU, aop=OR, a=ZERO, b=ZERO, d=T6)
+    u(unit=ALU, aop=OR, a=ZERO, b=T2, d=T6, size=1)
+    u(unit=SHIFT, aop=5, a=T2, d=T5, usek=1, k=16)      # the selector
+    lookup(T5, T2, T7)
+    check(K_GCALL, T7, T2)
+    unless_ok('gp_sel', 'np_sel')
+    u(unit=SPEC, aop=NOP, jmp=name + '_in', ucc=UPC(P_LEVEL))
+    label(name + '_push')
+    u(unit=SPEC, aop=CHKCS, a=T6)
     u(unit=STORE, a=ESP, aop=ST_READ, b=R_FLAGS, seg=SS, a16=1, aupd=1, size=size)
     u(unit=STORE, a=ESP, aop=ST_READ, b=R_SEGSEL, c=CS, seg=SS, a16=1, aupd=1,
       size=size)
-    u(unit=STORE, a=ESP, c=T4, seg=SS, a16=1, aupd=1, size=size)
+    push_n(T4, size)
     u(unit=SPEC, aop=NOP, jmp=name + '_n', ucc=UNFLT)
-    u(unit=ALUI, aop=AND, a=T1, d=T6, usek=1, k=8)
+    u(unit=ALUI, aop=AND, a=T1, d=T7, usek=1, k=8)
     u(unit=SPEC, aop=NOP, jmp=name + '_n', ucc=UZ)
-    u(unit=STORE, a=ESP, c=ZERO, seg=SS, a16=1, aupd=1, size=size)
+    u(unit=SPEC, aop=READ, b=R_DESC, cc=R_ERR, d=T7)
+    push_n(T7, size)
     label(name + '_n')
-    if size == 2:
-        u(unit=ALU, aop=OR, a=ZERO, b=T3, d=T6)         # the offset's upper half
-        u(unit=ALU, aop=OR, a=ZERO, b=T2, d=T6, size=1, jmp='int_pm_go')
+    u(unit=SPEC, aop=FLBIT, cc=8)                       # IF (an interrupt gate), TF, NT off
+    u(unit=SPEC, aop=SETSEG, a=T5, seg=CS, size=1)
+    u(unit=SPEC, aop=NOP, c=T6, br=7, cc=J_REG, end=1)
+    label(name + '_in')
+    u(unit=SPEC, aop=NOP, a=T7, cc=W_PROT, b=TPL_DPL)
+    tss_stack(T2, T3, name)
+    lookup(T3, None, T7)
+    check(K_STACK, T7)
+    unless_ok('ts_sel', 'ss_sel')
+    # Out of virtual 8086 mode, if it was that: the four data segment
+    # registers go on the new stack first, and are emptied.
+    u(unit=SPEC, aop=NOP, cc=W_PROT, b=VM_OFF)
+    u(unit=SPEC, aop=SETSEG, a=T3, seg=SS, size=1)
+    u(unit=ALU, aop=OR, a=ZERO, b=T2, d=ESP, ssz=1)
+    u(unit=SPEC, aop=NOP, jmp=name + '_nv', ucc=UNPX(X_VMINT))
+    for seg in (GS, FS, DS, ES):
+        u(unit=SPEC, aop=READ, b=R_SEGSEL, seg=seg, d=T7)
+        push_n(T7, size)
+    for seg in (GS, FS, DS, ES):
+        u(unit=SPEC, aop=SETSEG, a=ZERO, seg=seg, size=1)
+    label(name + '_nv')
+    u(unit=SPEC, aop=READ, b=R_DESC, cc=R_SSPREV, d=T7)
+    push_n(T7, size)
+    u(unit=SPEC, aop=READ, b=R_ESP0, d=T7)
+    push_n(T7, size)
+    u(unit=SPEC, aop=NOP, jmp=name + '_push')
+# A bad gate: the error code is the vector's place in the table.
+for name, vec in (('int_gp', 13), ('int_np', 11)):
+    label(name)
+    u(unit=SHIFT, aop=4, a=T1, d=T7, usek=1, k=3)
+    u(unit=ALUI, aop=ADD, a=T7, d=T7, usek=1, k=2)
+    u(unit=SPEC, aop=NOP, a=T7, cc=W_PROT, b=ERR_A)
+    u(unit=SPEC, aop=RAISE, cc=1, usek=1, k=vec, end=1)
+
+# ARPL: if the destination selector's level is inside the source's, it
+# is moved out to it and ZF set; else ZF cleared.
+for form in ('r', 'm'):
+    label('arpl_' + form)
+    u(unit=ALU, aop=OR, a=ZERO, selb=REG, d=T2, size=1)
+    u(unit=ALUI, aop=AND, a=T1, d=T3, usek=1, k=3)
+    u(unit=ALUI, aop=AND, a=T2, d=T4, usek=1, k=3)
+    u(unit=ALU, aop=SUB, a=T3, b=T4, d=T5)
+    u(unit=ALU, aop=SIGN, a=T5, d=T5)
+    u(unit=SPEC, aop=FLBIT, cc=12, jmp='nop_end', ucc=UZ)
+    u(unit=ALU, aop=SUB, a=T1, b=T3, d=T1)
+    u(unit=ALU, aop=ADD, a=T1, b=T4, d=T1)
+    u(unit=SPEC, aop=FLBIT, cc=13)
+    if form == 'r':
+        u(unit=ALU, aop=OR, a=ZERO, b=T1, seld=RM, d=0, size=1, end=1)
     else:
-        u(unit=ALU, aop=OR, a=ZERO, b=ZERO, d=T6)
-        u(unit=ALU, aop=OR, a=ZERO, b=T2, d=T6, size=1)
-label('int_pm_go')
-u(unit=SHIFT, aop=5, a=T2, d=T2, usek=1, k=16)          # the selector
-u(unit=ALUI, aop=AND, a=T3, hi=H_A, d=T3, size=0, usek=1, k=1)
-u(unit=SPEC, aop=FLBIT, cc=TF_OFF, jmp='int_pm_cs', ucc=UNZ)    # a trap gate: IF stays
-u(unit=SPEC, aop=FLBIT, cc=8)
-label('int_pm_cs')
-u(unit=SPEC, aop=SETSEG, a=T2, seg=CS)
-u(unit=SPEC, aop=NOP, c=T6, br=7, cc=J_REG, end=1)
+        u(unit=STORE, cc=2, c=T1, size=1, end=1)
+label('zf_off_end')
+u(unit=SPEC, aop=FLBIT, cc=12, end=1)
+lower()
+
+# BOUND: the register against the two bounds in memory, as signed
+# numbers; outside them, fault 5. The flags are not its to change, so
+# they are kept over the comparisons.
+at([0x62], modrm=1, mem=False)
+invalid()
+at([0x62], modrm=1, mem=True)
+u(unit=SPEC, aop=LEA, ea=1, d=T5)
+u(unit=LOAD, a=T5, selseg=SEG_EA, aupd=1, d=T2, size=ISIZE)
+u(unit=LOAD, a=T5, selseg=SEG_EA, d=T3, size=ISIZE)
+u(unit=SPEC, aop=READ, b=R_FLAGS, d=T6)
+u(unit=ALU, aop=CMP, sela=REG, b=T2, size=ISIZE, fm=1)
+u(unit=SPEC, aop=NOP, jmp='bound_bad', ucc=12)          # less than the lower
+u(unit=ALU, aop=CMP, sela=REG, b=T3, size=ISIZE, fm=1)
+u(unit=SPEC, aop=NOP, jmp='bound_bad', ucc=15)          # greater than the upper
+u(unit=SPEC, aop=WRFL, a=T6, size=1, usek=1, k=-1, end=1)
+upper()
+label('bound_bad')
+u(unit=SPEC, aop=WRFL, a=T6, size=1, usek=1, k=-1)
+u(unit=SPEC, aop=RAISE, usek=1, k=5, end=1)
+lower()
+
+at([0x63], modrm=1, mem=False)                          # ARPL (the decoder refuses it in real mode)
+u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=1, jmp='arpl_r')
+at([0x63], modrm=1, mem=True)
+u(unit=LOAD, ea=1, d=T1, size=1, jmp='arpl_m')
 
 # SLDT, STR, LLDT, LTR (0F 00; the decoder refuses it in real mode).
 # The selectors read as segments 6 and 7. VERR and VERW are not here.
@@ -1315,7 +1719,7 @@ at([0x00], modrm=1, mem=False, group=1, map0f=1)
 u(unit=SPEC, aop=READ, b=R_SEGSEL, seg=SEG_LDT, seld=RM, d=0, size=ISIZE, end=1)
 u(unit=SPEC, aop=READ, b=R_SEGSEL, seg=SEG_TR, seld=RM, d=0, size=ISIZE, end=1)
 u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=1, jmp='lldt')
-u(unit=SPEC, aop=NOP, sela=RM, cc=W_TR, end=1)
+u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=1, jmp='ltr')
 u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=1, jmp='verx')     # VERR
 u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=1, jmp='verx')     # VERW
 invalid(2)
@@ -1327,14 +1731,26 @@ u(unit=LOAD, ea=1, d=T1, size=1, jmp='ltr')
 u(unit=LOAD, ea=1, d=T1, size=1, jmp='verx')
 u(unit=LOAD, ea=1, d=T1, size=1, jmp='verx')
 invalid(2)
-label('ltr')
-u(unit=SPEC, aop=NOP, a=T1, cc=W_TR, end=1)
+upper()
+label('ltr')                                            # the TSS becomes busy
+u(unit=SPEC, aop=NOP, a=T1, cc=W_TR)
+lookup(T1, T2, T3)
+u(unit=SHIFT, aop=5, a=T3, d=T4, usek=1, k=8)
+u(unit=ALUI, aop=OR, a=T4, d=T4, usek=1, k=2)
+u(unit=STORE, a=T7, disp=1, usek=1, k=5, seg=FLAT, c=T4, size=0)
+u(unit=SPEC, aop=NOP, a=T3, b=T2, cc=W_TRB, end=1)
+label('lldt_null')
+u(unit=SPEC, aop=NOP, a=T1, cc=W_LDT)
+u(unit=SPEC, aop=NOP, a=ZERO, b=ZERO, cc=W_LDTB, end=1)
 label('lldt')
+u(unit=ALUI, aop=AND, a=T1, d=T2, usek=1, k=-4)
+u(unit=SPEC, aop=NOP, jmp='lldt_null', ucc=UZ)
 u(unit=SPEC, aop=NOP, a=T1, cc=W_LDT)
 u(unit=SPEC, aop=READ, b=R_DESC, d=T7)
 u(unit=LOAD, a=T7, seg=FLAT, d=T2)
 u(unit=LOAD, a=T7, disp=1, usek=1, k=4, seg=FLAT, d=T3)
 u(unit=SPEC, aop=NOP, a=T3, b=T2, cc=W_LDTB, end=1)
+lower()
 
 
 # BSF and BSR: a loop, a bit a round (three words). BSF walks a mask
@@ -1346,6 +1762,7 @@ for op, name in ((0xBC, 'bsf'), (0xBD, 'bsr')):
     u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=ISIZE, jmp=name)
     at([op], modrm=1, mem=True, map0f=1)
     u(unit=LOAD, ea=1, d=T1, size=ISIZE, jmp=name)
+upper()
 label('bsf')
 u(unit=ALU, aop=OR, a=T1, b=ZERO, d=T1, size=ISIZE)
 u(unit=SPEC, aop=FLBIT, cc=ZF_ON, jmp='nop_end', ucc=UZ)
@@ -1371,6 +1788,7 @@ u(unit=ALU, aop=DEC, a=T2, d=T2, jmp='bsr_loop')
 label('bs_done')
 u(unit=SPEC, aop=FLBIT, cc=ZF_OFF)
 u(unit=ALU, aop=OR, a=ZERO, b=T2, seld=REG, d=0, size=ISIZE, end=1)
+lower()
 
 
 # LAR, LSL, VERR, VERW: the selector in T1 is looked up (W_SEL); if it
@@ -1385,6 +1803,7 @@ at([0x02, 0x03], modrm=1, mem=False, map0f=1)
 u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=1, jmp='larlsl')
 at([0x02, 0x03], modrm=1, mem=True, map0f=1)
 u(unit=LOAD, ea=1, d=T1, size=1, jmp='larlsl')
+upper()
 for name in ('larlsl', 'verx'):
     label(name)
     u(unit=SPEC, aop=NOP, a=T1, cc=W_SEL)
@@ -1394,39 +1813,92 @@ for name in ('larlsl', 'verx'):
     if name == 'larlsl':
         u(unit=LOAD, a=T7, seg=FLAT, d=T3)
         u(unit=LOAD, a=T7, disp=1, usek=1, k=4, seg=FLAT, d=T2)
-        u(unit=SPEC, aop=READ, b=R_DESC, selcc=1, a=T2, c=T3, seld=REG, d=0,
-          size=ISIZE)
-        u(unit=SPEC, aop=FLBIT, cc=ZF_ON, end=1)
+        u(unit=SPEC, aop=READ, b=R_DESC, selcc=1, a=T2, c=T3, d=T4)
+        u(unit=SPEC, aop=NOP, jmp='zf_off_end', ucc=UNPC(P_OK))
+        u(unit=SPEC, aop=FLBIT, cc=ZF_ON)
+        u(unit=ALU, aop=OR, a=ZERO, b=T4, seld=REG, d=0, size=ISIZE, end=1)
     else:
         u(unit=LOAD, a=T7, disp=1, usek=1, k=4, seg=FLAT, d=T2)
         u(unit=SPEC, aop=READ, b=R_DESC, cc=1, selseg=SEG_REG, a=T2, d=T4)
-        u(unit=ALU, aop=OR, a=T4, b=ZERO, d=T4)
-        u(unit=SPEC, aop=FLBIT, cc=ZF_OFF, jmp='nop_end', ucc=UZ)
+        u(unit=SPEC, aop=NOP, jmp='zf_off_end', ucc=UNPC(P_OK))
         u(unit=SPEC, aop=FLBIT, cc=ZF_ON, end=1)
+lower()
+
+
+def mark_rmw():
+    """Give every LOAD that a store to the same place can follow (a
+    STORE with cc bit 1, which reuses the load's address) the RMW mark:
+    follow the words from the load until the instruction ends or
+    another memory access comes."""
+    def word(a):
+        if a < UPPER:
+            return words_lo[a] if a < len(words_lo) else None
+        return words_hi[a - UPPER] if a - UPPER < len(words_hi) else None
+
+    def unit(x):
+        return x['w'] >> 23 & 7
+
+    marked = 0
+    for base, lst in ((0, words_lo), (UPPER, words_hi)):
+        for i, x in enumerate(lst):
+            if unit(x) != LOAD:
+                continue
+            todo, seen, found = [(base + i, True)], set(), False
+            while todo and not found:
+                a, start = todo.pop()
+                if a in seen:
+                    continue
+                seen.add(a)
+                y = word(a)
+                if y is None:
+                    continue
+                if not start:
+                    if unit(y) == STORE and y['w'] >> 44 & 1 and (y['w'] >> 40 & 7) != 1:
+                        found = True
+                        break
+                    if unit(y) in (LOAD, LOADOP, STORE):
+                        continue
+                if y['end']:
+                    continue
+                jmp = y['jmp']
+                if jmp is not None:
+                    todo.append((labels[jmp] if isinstance(jmp, str) else jmp, False))
+                    if y['ucc'] is None:
+                        continue
+                todo.append((a + 1, False))
+            if found:
+                x['w'] |= RMW << 26
+                marked += 1
+    return marked
 
 
 def main():
     out = sys.argv[1]
+    marked = mark_rmw()
     # An instruction's first word is cached with one immediate. If that
     # is the word's constant, nothing later may need the real one.
     for a in attr:
         if a >> 15 & 1:
             for e in range(a & 0x3FF, (a & 0x3FF) + (8 if a >> 16 & 1 else 1)):
-                assert not words[e]['usek'] or words[e]['end'], \
+                assert not words_lo[e]['usek'] or words_lo[e]['end'], \
                     'word %d: a first word with a constant must be the last' % e
                 # Its jump is settled when it is cached.
-                assert words[e]['ucc'] is None or UREP <= words[e]['ucc'] < UA_NOT1, \
+                assert words_lo[e]['ucc'] is None or UREP <= words_lo[e]['ucc'] < UA_NOT1, \
                     'word %d: a first word may not jump on flags' % e
     with open(out + '/ucode.hex', 'w') as f:
-        for i in range(1024):
-            if i >= len(words):
+        assert len(words_lo) <= UPPER and len(words_hi) <= UPPER, 'the microcode ROM is full'
+        for i in range(2048):
+            if i < len(words_lo):
+                x = words_lo[i]
+            elif UPPER <= i < UPPER + len(words_hi):
+                x = words_hi[i - UPPER]
+            else:
                 f.write('0\n')
                 continue
-            x = words[i]
             jmp = x['jmp']
             target = labels[jmp] if isinstance(jmp, str) else (jmp or 0)
-            k = target if jmp is not None else x['k'] & 0x3FF
-            w = (x['w'] | k << 48 | (1 if jmp is not None else 0) << 58
+            k = target if jmp is not None else x['k'] & 0x7FF
+            w = (x['w'] | (k & 0x3FF) << 48 | (k >> 10) << 85 | (1 if jmp is not None else 0) << 58
                  | (1 if x['ucc'] is not None else 0) << 59
                  | ((x['ucc'] or 0) & 15) << 60 | ((x['ucc'] or 0) >> 4 & 1) << 81
                  | ((x['ucc'] or 0) >> 5 & 3) << 83
@@ -1437,7 +1909,8 @@ def main():
     with open(out + '/attr.hex', 'w') as f:
         for a in attr:
             f.write('%x\n' % a)
-    print('microcode: %d words' % len(words))
+    print('microcode: %d words in the lower half, %d in the upper; %d loads marked read-modify-write'
+          % (len(words_lo), len(words_hi), marked))
 
 
 if __name__ == '__main__':

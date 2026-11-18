@@ -43,6 +43,63 @@ A fault shared by the model and the RTL is invisible to lockstep.
 Layer 1 exists to catch those: its expected results come from real
 chips, not from us.
 
+### A protected-mode test suite for the model
+
+The vectors are real mode. For protected mode the model is checked
+against **test386.asm** (github.com/barotto/test386.asm), a test ROM
+for 80386 emulators: rings, virtual 8086 mode, task switches, paging
+and page faults, segment faults, and the instruction set. It is
+GPL, so it is fetched when wanted and stays out of the repository.
+The model passes all of it (round 28). To run it:
+
+```
+git clone https://github.com/barotto/test386.asm ext/test386
+cd ext/test386
+# in src/configuration.asm: OUT_PORT equ 0xE9; ROM128 equ 1 for the
+# task-switch tests (a 128 KB ROM)
+nasm -i./src/ -f bin src/test386.asm -w-all -o test386.bin
+M86_POST=1 M86_E9=1 output/sim/m86pc -bios test386.bin -max 100000000 > ee.txt
+diff ee.txt test386-EE-reference.txt
+```
+
+The last diagnostic code printed must be `ff`, and the output must
+equal the reference file (44,926 lines of arithmetic results and
+flags).
+
+Since round 29 the core runs it too, in lockstep with the model
+(the 64 KB ROM: the 128 KB one adds task switches, which the core
+lacks):
+
+```
+make -C sim ../output/b/rtlpcb
+M86_POST=1 output/b/rtlpcb -bios test386.bin -max 100000000
+```
+
+It ends with "no difference" after 79.7 million instructions, about
+ten minutes. A build with `VDEF=+define+M86_DBG` prints every fault
+the core takes, which is how the suite's failures were found.
+
+### Requests from outside
+
+`M86B_DMA=n` in the environment makes the lockstep bench ask the
+core for a byte of memory every n cycles, as the Sound Blaster
+does. The model knows nothing of it, so any difference is a fault
+in how the core takes the request. Run with it: a DOS boot, the
+protected-mode and paging tests, and the 386 test suite.
+
+### A memory manager
+
+Jemm386 (github.com/Baron-von-Riedesel/Jemm; it needs JWasm and
+JWlink from the same author, which build on Linux with GCC) puts
+DOS into virtual 8086 mode with paging. With `JEMM386.EXE` on the
+card's D: drive (`tools/mkcard.py`):
+
+```
+output/b/rtlpcb -bios output/bios/bios.bin -max 900000000 -disk card.img \
+    -dexpect 'C:\>' -type 'd:\r' -dexpect 'D:\>' -type 'jemm386 load\r' \
+    -run 40000000 -type 'c:\speed\r' -run 60000000
+```
+
 ## Instruction vectors
 
 Hardware-captured single-instruction test sets exist for the 8088,

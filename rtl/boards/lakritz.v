@@ -150,7 +150,7 @@ module `M86_TOP (
     wire [31:0] xv_wdata, lb_q;
     wire [7:0]  lb_addr;
     wire        spk, opl_we;
-    wire [7:0]  opl_a, opl_d;
+    wire [7:0]  opl_a, opl_d, sb_sample;
     m86_soc #(.CLK_HZ(33157895), .BAUD(115200),
               .MAIN_MEM(1), .MEM_AW(25), .MEM_TRAIN(0),
               .CACHE_LINE_BITS(10), .EXT_KB(31488),
@@ -175,7 +175,7 @@ module `M86_TOP (
         .hid_clk(clk12), .hid_report(hid_report), .hid_typ(hid_typ),
         .hid_mod(hid_mod), .hid_k1(hid_k1), .hid_k2(hid_k2),
         .hid_k3(hid_k3), .hid_k4(hid_k4),
-        .hdmi(hdmi), .spk(spk), .opl_we(opl_we), .opl_a(opl_a), .opl_d(opl_d),
+        .hdmi(hdmi), .spk(spk), .sb_sample(sb_sample), .opl_we(opl_we), .opl_a(opl_a), .opl_d(opl_d),
         .halted(halted), .last_exc(last_exc), .tick18(tick18));
 
     // The memory: the display's line reads, the VGA's CPU side and
@@ -221,7 +221,7 @@ module `M86_TOP (
     wire a_frame, hdmi;
     wire signed [15:0] a_sample;
     m86_audio audio (
-        .clk(clk), .opl_we(opl_we), .opl_a(opl_a), .opl_d(opl_d), .spk(spk),
+        .clk(clk), .opl_we(opl_we), .opl_a(opl_a), .opl_d(opl_d), .spk(spk), .sb(sb_sample),
         .aclk(CLK_48), .arst(!apor[7]),
         .tick(), .frame_req(a_frame), .sample(a_sample), .sd_l(a_sd), .sd_r());
 `ifdef M86_PT8211

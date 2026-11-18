@@ -46,6 +46,7 @@ module m86_opl2 #(
 
     // The tables: a quarter sine as attenuation, and the way back
     // (tools/mkopl.py).
+    (* rom_style = "logic" *)             // (block RAM is short on Lakritz)
     reg [11:0] rom [0:511];
     reg [8:0]  roma;
     reg [11:0] romq;

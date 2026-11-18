@@ -32,7 +32,7 @@ mode range, and reset starts at FFFF:0000h, which is the same place.
 
 | Ports | Device | Phase |
 |---|---|---|
-| 000h–00Fh | DMA controller 1 (8237) | 5 |
+| 000h–00Fh, 083h | DMA controller 1 (8237): channel 1 only, for the Sound Blaster | 3 (round 30, [sound.md](sound.md#the-sound-blaster)) |
 | 020h–021h | Interrupt controller 1 (8259) | 3 |
 | 040h–043h | Timer (8254) | 3 |
 | 060h, 064h | Keyboard controller (8042) | 3 (data port), 4 (full) |
@@ -50,10 +50,11 @@ mode range, and reset starts at FFFF:0000h, which is the same place.
 | 0ECh | Mach86 private: memory port, data (32 bits) | 3 |
 | 0E3h, 0E5h–0E7h, 0E9h–0EBh, 0EDh–0EFh | Mach86 private: shadow control, meta interface (provisional) | 3 |
 | 201h | Game port | 5 |
-| 220h–22Fh | Sound Blaster | 5 |
+| 220h–22Fh | Sound Blaster: the DSP of a 2.0; the AdLib again at 228h, 229h | 3 (round 30, [sound.md](sound.md#the-sound-blaster)) |
 | 388h–389h | AdLib (OPL2); also reachable through the Sound Blaster ports | 3 (round 21, [sound.md](sound.md)) |
 | 1E0h | Mach86's speed control: cycles the CPU waits after each instruction ([speed.md](speed.md)) | 3 (round 24) |
 | 1E1h | Mach86's display switch: bit 0 set is HDMI with sound, clear is DVI ([sound.md](sound.md#sound-on-the-displays-cable)) | 3 (round 25) |
+| 1E8h | The CPU's own: what its paging unit read across two pages ([cpu_b.md](cpu_b.md#round-29)). Reads give the core's `x_rd`, writes are ignored; software has no use for it | 3 (round 29) |
 | 0E3h | Mach86's mouse port (not a PC's), with interrupt 12 ([mouse.md](mouse.md)) | 3 (round 21) |
 | 3B0h–3BBh | VGA, monochrome register addresses | 4 |
 | 3C0h–3CFh | VGA | 4 |
@@ -81,7 +82,7 @@ The rest of the private range is provisional.
 | 1 | Keyboard | 3 |
 | 2 | Cascade from controller 2 | 4 |
 | 4 | COM1 (also the serial mouse) | 3 |
-| 5 or 7 | Sound Blaster, selectable | 5 |
+| 7 | Sound Blaster | 3 (round 30) |
 | 8 | Real-time clock | 4 |
 
 Other lines are unconnected. NMI is unused by the PC side and is a
@@ -91,7 +92,7 @@ candidate entry for the meta interface.
 
 | Channel | Use | Phase |
 |---|---|---|
-| 1 | Sound Blaster 8-bit audio | 5 |
+| 1 | Sound Blaster 8-bit audio | 3 (round 30) |
 | 4 | Cascade | 5 |
 
 Other channels exist in the controller and have no device.

@@ -142,6 +142,7 @@ module m86_dcache #(
     // ---- tags: two lookups, for the first and the last byte ----
     reg  [TB:0]   tags [0:(1<<IB)-1];       // {valid, tag}
     reg  [TB:0]   tq_a, tq_b;
+    (* ram_style = "distributed" *)       // (block RAM is short on Lakritz)
     reg           dirty [0:(1<<IB)-1];
     reg           dq;
     integer i;

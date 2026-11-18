@@ -137,7 +137,7 @@ $(BOUT)/rtlpcb: $(RTLB) $(BOUT)/ucode.hex m86pc.c pc.c vga.c sdcard.c m86cpu.c l
 	$(CC) $(CFLAGS) -c -o $(BOUT)/sdcard.o sdcard.c
 	$(CC) $(CFLAGS) -c -o $(BOUT)/m86cpu.o m86cpu.c
 	@rm -f $(BOUT)/obj_pc/../rtlpcb		# so that it is always linked afresh
-	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86b_core $(BPARAM) \
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86b_core $(VDEF) $(BPARAM) \
 	  -GUCODE='"$(CURDIR)/$(BOUT)/ucode.hex"' -GATTR='"$(CURDIR)/$(BOUT)/attr.hex"' \
 	  -Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-BLKSEQ -Wno-UNUSED \
 	  -Wno-CASEOVERLAP -Wno-UNOPTFLAT -Wno-LATCH -Wno-MULTIDRIVEN \
@@ -187,7 +187,7 @@ $(SOCOUT)/soc_tb: $(RTLSOC) $(BIOS) soc_tb.cpp sdcard.c pc.h ../sw/ucode/m86b_uc
 	python3 ../tools/mkfont.py ../sw/font/font16.mem $(SOCOUT)/font.hex
 	$(CC) $(CFLAGS) -c -o $(SOCOUT)/sdcard.o sdcard.c
 	@rm -f $(SOCOUT)/soc_tb
-	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86_soc \
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86_soc $(VDEF) \
 	  -GUCODE='"$(CURDIR)/$(SOCOUT)/ucode.hex"' -GATTR='"$(CURDIR)/$(SOCOUT)/attr.hex"' \
 	  -GROM0='"$(CURDIR)/$(SOCOUT)/rom0.hex"' -GROM1='"$(CURDIR)/$(SOCOUT)/rom1.hex"' \
 	  -GROM2='"$(CURDIR)/$(SOCOUT)/rom2.hex"' -GROM3='"$(CURDIR)/$(SOCOUT)/rom3.hex"' \
@@ -293,6 +293,26 @@ check-pm2: all $(BOUT)/rtlpcb $(SOCOUT)/soc_tb_main $(OUT)/pm2test.bin
 	  -expect "pm2 test passed"
 	@echo "pm2: protected mode's second part passes on the model, in lockstep, and on the SoC"
 
+check-pm3: all $(BOUT)/rtlpcb $(SOCOUT)/soc_tb_main $(OUT)/pm3test.bin
+	cp $(OUT)/pm3test.bin $(SOCOUT)/pm3test.img
+	$(OUT)/m86pc -bios $(BIOS) -disk $(SOCOUT)/pm3test.img -max 50000000 \
+	  -dexpect "pm3 test passed" > /dev/null
+	$(BOUT)/rtlpcb -bios $(BIOS) -disk $(SOCOUT)/pm3test.img -max 200000000 \
+	  -expect "pm3 test passed"
+	$(SOCOUT)/soc_tb_main -quiet -disk $(SOCOUT)/pm3test.img -max 400000000 \
+	  -expect "pm3 test passed"
+	@echo "pm3: protected mode's third part (privilege levels) passes on the model, in lockstep, and on the SoC"
+
+check-pg: all $(BOUT)/rtlpcb $(SOCOUT)/soc_tb_main $(OUT)/pgtest.bin
+	cp $(OUT)/pgtest.bin $(SOCOUT)/pgtest.img
+	$(OUT)/m86pc -bios $(BIOS) -disk $(SOCOUT)/pgtest.img -max 50000000 \
+	  -dexpect "pg test passed" > /dev/null
+	$(BOUT)/rtlpcb -bios $(BIOS) -disk $(SOCOUT)/pgtest.img -max 200000000 \
+	  -expect "pg test passed"
+	$(SOCOUT)/soc_tb_main -quiet -disk $(SOCOUT)/pgtest.img -max 400000000 \
+	  -expect "pg test passed"
+	@echo "pg: paging passes on the model, in lockstep, and on the SoC"
+
 # The double shifts, the bit instructions and a 486's own, on the model
 # and in lockstep.
 check-486: all $(BOUT)/rtlpcb $(OUT)/i486test.bin
@@ -359,7 +379,7 @@ $(SOCOUT)/soc_tb_main: $(RTLSOC) $(BIOS) soc_tb.cpp sdcard.c pc.h ../sw/ucode/m8
 	python3 ../tools/mkfont.py ../sw/font/font16.mem $(SOCOUT)/font.hex
 	$(CC) $(CFLAGS) -c -o $(SOCOUT)/sdcard.o sdcard.c
 	@rm -f $(SOCOUT)/soc_tb_main
-	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86_soc -GMAIN_MEM=1 -GEXT_KB=15360 -GVGA_EXT=1 \
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86_soc $(VDEF) -GMAIN_MEM=1 -GEXT_KB=15360 -GVGA_EXT=1 \
 	  -GUCODE='"$(CURDIR)/$(SOCOUT)/ucode.hex"' -GATTR='"$(CURDIR)/$(SOCOUT)/attr.hex"' \
 	  -GROM0='"$(CURDIR)/$(SOCOUT)/rom0.hex"' -GROM1='"$(CURDIR)/$(SOCOUT)/rom1.hex"' \
 	  -GROM2='"$(CURDIR)/$(SOCOUT)/rom2.hex"' -GROM3='"$(CURDIR)/$(SOCOUT)/rom3.hex"' \
@@ -428,6 +448,8 @@ check-tb:
 	iverilog -g2005 -o $(SOCOUT)/spk_tb m86_spk_tb.v ../rtl/soc/m86_spk.v $(ZL)/audio_spdif.v
 	vvp -n $(SOCOUT)/spk_tb | tee $(SOCOUT)/spk_tb.log | tail -n 1
 	grep -q "spk: pass" $(SOCOUT)/spk_tb.log
+	@mkdir -p $(OPLOUT)
+	python3 ../tools/mkopl.py $(OPLOUT)/opl_rom.hex
 	iverilog -g2005 -o $(SOCOUT)/audio_tb m86_audio_tb.v ../rtl/soc/m86_audio.v \
 	  ../rtl/soc/m86_spk.v ../rtl/soc/m86_opl2.v $(ZL)/audio_out.v
 	vvp -n $(SOCOUT)/audio_tb | tee $(SOCOUT)/audio_tb.log | tail -n 1
@@ -597,7 +619,7 @@ $(CARDOUT)/shsucdhd.exe: $(SHSU)/shsucdhd.nsm ../tools/mkexe.py
 	$(NASMOLD) -f bin -o $(CARDOUT)/shsucdhd.bin $(CARDOUT)/shsucdhd_flat.nsm
 	python3 ../tools/mkexe.py $(CARDOUT)/shsucdhd.bin $@
 
-$(BOOTIMG): $(OUT)/dostest.com $(OUT)/speed.com $(OUT)/gfx.com $(OUT)/tune.com $(OUT)/adlib.com $(OUT)/mouse.com $(OUT)/mouset.com $(OUT)/gfx2.com $(OUT)/xmstest.com $(OUT)/slow.com $(OUT)/hdmi.com $(CARDOUT)/shsucdx.com \
+$(BOOTIMG): $(OUT)/dostest.com $(OUT)/speed.com $(OUT)/gfx.com $(OUT)/tune.com $(OUT)/adlib.com $(OUT)/mouse.com $(OUT)/mouset.com $(OUT)/gfx2.com $(OUT)/xmstest.com $(OUT)/slow.com $(OUT)/hdmi.com $(OUT)/sbtest.com $(CARDOUT)/shsucdx.com \
             $(CARDOUT)/shsucdhd.exe ../tests/dos/card.cfg \
             ../tests/dos/autoexec.bat ../tests/dos/mount.bat
 	@test -f $(DOS)/KERNEL32.SYS -a -f $(DOS)/HIMEMX.EXE || \
@@ -606,7 +628,7 @@ $(BOOTIMG): $(OUT)/dostest.com $(OUT)/speed.com $(OUT)/gfx.com $(OUT)/tune.com $
 	$(FATIMG) $@ $(DOS)/KERNEL32.SYS=KERNEL.SYS \
 	  ../tests/dos/card.cfg=CONFIG.SYS ../tests/dos/autoexec.bat=AUTOEXEC.BAT \
 	  $(DOS)/FREECOM.COM=COMMAND.COM $(DOS)/HIMEMX.EXE=HIMEMX.EXE \
-	  $(OUT)/xmstest.com=XMSTEST.COM $(OUT)/slow.com=SLOW.COM $(OUT)/hdmi.com=HDMI.COM \
+	  $(OUT)/xmstest.com=XMSTEST.COM $(OUT)/slow.com=SLOW.COM $(OUT)/hdmi.com=HDMI.COM $(OUT)/sbtest.com=SBTEST.COM \
 	  $(CARDOUT)/shsucdx.com=SHSUCDX.COM \
 	  $(CARDOUT)/shsucdhd.exe=SHSUCDHD.EXE ../tests/dos/mount.bat=MOUNT.BAT \
 	  $(OUT)/dostest.com=DOSTEST.COM $(OUT)/speed.com=SPEED.COM \
@@ -641,6 +663,7 @@ CARDSESSION = -expect 'C:\>' -type 'dir d:\r' -expect 'TEST     ISO' \
 	  -type 'tune\r' -dexpect "bell" -dexpect "done" \
 	  -run 3000000 -type 'adlib\r' -dexpect "AdLib found" -dexpect "chord" -dexpect "done" \
 	  -run 3000000 -type 'xmstest\r' -dexpect "KB free" -dexpect "XMS test passed" \
+	  -run 3000000 -type 'sbtest\r' -dexpect "SB test passed" \
 	  -run 3000000 -type 'mouse\r' -dexpect "Mach86 mouse driver" \
 	  -run 3000000 -type 'mouset\r' -dexpect "mouse driver ok" -dexpect "x=320 y=99 b=0" \
 	  -mouse 10,6,0 -dexpect "x=330 y=102 b=0" \
@@ -659,6 +682,7 @@ check-card: card
 	  -expect 'C:\>' -type 'dir e:\r' -expect 'HELLO    TXT' \
 	  -expect 'C:\>' -type 'type e:\hello.txt\r' -expect 'on the test CD image' \
 	  -expect 'C:\>' -type 'xmstest\r' -expect 'XMS test passed' \
+	  -expect 'C:\>' -type 'sbtest\r' -expect 'SB test passed' \
 	  -expect 'C:\>' -type 'slow 4\r' -expect 'speed control: 4 ' \
 	  -expect 'C:\>' -type 'slow off\r' -expect 'speed control: 0 ' \
 	  -expect 'C:\>' -type 'hdmi on\r' -expect 'HDMI with sound' \
@@ -716,6 +740,10 @@ $(OUT)/gfx2.com: ../tests/prog/gfxtest2.asm
 	$(NASM) -f bin -DDOSCOM -o $@ $<
 
 $(OUT)/xmstest.com: ../tests/dos/xmstest.asm
+	@mkdir -p $(OUT)
+	$(NASM) -f bin -o $@ $<
+
+$(OUT)/sbtest.com: ../tests/dos/sbtest.asm
 	@mkdir -p $(OUT)
 	$(NASM) -f bin -o $@ $<
 
