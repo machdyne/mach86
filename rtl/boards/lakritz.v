@@ -154,7 +154,7 @@ module `M86_TOP (
     m86_soc #(.CLK_HZ(33157895), .BAUD(1000000),
               .MAIN_MEM(1), .MEM_AW(25), .MEM_TRAIN(0),
               .CACHE_LINE_BITS(10), .EXT_KB(31488),
-              .VGA_EXT(1), .VGA_BRAM(0)) soc (
+              .VGA_EXT(1), .VGA_BRAM(0), .CPU_WIN(0)) soc (
         .clk(clk), .rst(rst), .vclk(pclk),
         .v_r(v_r), .v_g(v_g), .v_b(v_b),
         .v_hsync(v_hs), .v_vsync(v_vs), .v_de(v_de),

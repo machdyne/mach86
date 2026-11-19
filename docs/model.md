@@ -175,7 +175,14 @@ written to the diagnostic port 190h; `M86_E9=1` sends bytes written
 to port E9h to standard output; `M86_FAULTS=n` prints the first n
 faults taken with PE set (vector, error code, level, address and
 bytes); `M86_BREAK=offset` (hexadecimal) prints the sixteen
-instructions before execution first reaches that offset.
+instructions before execution first reaches that offset. Two more
+are for looking at what a program does: `M86_IO=n` prints, after n
+instructions, the next 200 port reads with the address of the
+instruction that made them; `M86_DC=1` prints every 100 million
+instructions how often a decoded-instruction cache of several
+shapes would have missed (2,048, 4,096 and 8,192 entries; two ways
+of 1,024; and three ways of mixing higher address bits into the
+index, all of which do worse than the plain index).
 
 `-expect` runs until the text appears on a screen row that changed
 since the previous step, and the exit status says whether every

@@ -8,7 +8,8 @@ design, what exists of it, and what has been measured.
 DOOM under DOS/4GW among them, at 33 MHz and 21.4 million
 instructions a second on plain code, measured there (1.4 to 1.6 cycles an
 instruction; DOS itself, with its calls and console output, is
-nearer 2.6). It passes 1,758,646 instruction vectors captured from
+nearer 2.6; DOOM is 1.95 in simulation since [round 32](#round-32),
+which has not been on a board yet). It passes 1,758,646 instruction vectors captured from
 a real 386 with 53 known deviations, and runs DOS and DOOM into its
 demo (194 million instructions) in lockstep with the reference model
 without a difference. It is a
@@ -17,8 +18,10 @@ without a difference. It is a
 levels (round 28), paging and virtual 8086 mode (round 29), in
 simulation so far ([pmode.md](pmode.md)).
 
+A faster core for the larger boards is planned: [cpu_c.md](cpu_c.md).
+
 The sections below were written as the design grew, and the older
-ones give the figures of their time; [round 26](#round-26) has the
+ones give the figures of their time; [round 32](#round-32) has the
 latest.
 
 ## The idea
@@ -595,11 +598,104 @@ instruction after ran with another's operands; the lockstep bench
 now has a request generator (`M86B_DMA=n`) that found it at once
 and guards it.
 
+### Round 32
+
+**Fewer cycles an instruction, at the same clock.** DOOM was
+profiled in lockstep (`LOCKSTEP_PROFILE=n`,
+[verification.md](verification.md)); what the profile said, and what
+was done about it:
+
+| What the profile showed | Share of DOOM's cycles | Now |
+|---|---:|---|
+| **Decoding.** 4.7% of instructions are not in the cache when they are met (the game's code is larger than 2,048 entries can hold), and each cost 8.6 cycles in the decoder and two more to reach execution | 21% | 3.3 cycles in the decoder: [the window](#the-decoders-window) |
+| `DIV` with 32 bits: 44 cycles, a bit of the quotient a cycle and twelve of microcode around it | 6% | 18: two bits a cycle, and a direct routine for the unsigned kind |
+| `CMP` and `TEST` of memory with an immediate: a load, the operation, and for `CMP` a store of what was read | 4% | One load-and-operate with the immediate: two cycles from four |
+| `INC` and `DEC` of memory, the ALU operations on memory with an immediate | 3% | Load-and-operate, then the store: three cycles from four |
+| `MOVZX` and `MOVSX` from memory: six and eight cycles | 2% | Two and four: a load that fills the register from a byte |
+
+The same 44 million instructions of DOOM (the end of one demo, a
+level's load from the card, the start of the next) took 105.3
+million cycles and take 86.1 million: **2.38 cycles an instruction
+before, 1.95 now, 22% more speed.** A stretch of the demo's play
+alone (31 million instructions) went from 2.12 to 1.80, 18% more:
+less of it is decoding. Dhrystone went from 1,239 cycles
+to 971 (0.459 to 0.586 DMIPS/MHz; 19.4 DMIPS at 33.16 MHz).
+
+What is left in DOOM's profile, largest first: loads are two cycles
+(a quarter of all cycles are instructions with a memory operand);
+shifts are three, the double shifts included; a return is three; and
+the decoder still has 8%. None of these has a cheap answer in this
+design: they are what a pipeline is for ([cpu_c.md](cpu_c.md)).
+
+#### The decoder's window
+
+The decoder used to ask the bus for every field of an instruction:
+the opcode, ModRM, SIB, the displacement, the immediate, each a
+request and an answer, with a look at the attribute ROM between.
+Now, when the eight bytes at the instruction's address may all be
+read (they lie inside the code segment's limit and, with paging, in
+one page), it reads them as two words into a window and takes the
+fields from there:
+
+- the opcode from the first word as it arrives, and the attribute
+  ROM read in that same cycle, already for the right form (memory or
+  register) by a look at the byte after the opcode;
+- ModRM, SIB and displacement together in the next cycle, when the
+  attribute word says there is a ModRM byte;
+- the immediate in the cycle after, or in the same one if there is
+  no ModRM byte.
+
+A prefix moves the window down a byte and costs a cycle. A field
+that is not in the window (an instruction longer than eight bytes),
+a far pointer, and every instruction whose eight bytes may not all
+be read go the old way, a field at a time, from where the window's
+use ended; so nothing is read that a 386 would not be allowed to
+read, and no fault can come from the window. The first fetch is
+made in the cycle the cache misses, not the one after.
+
+With the memory answering a cycle late, as the data cache on a
+board does for the decoder's reads, a decode was 12 to 16 cycles and
+is about 5.
+
+**It costs about 600 LUTs,** and Lakritz does not have them: with
+the window the design is 34 cells over the FPGA's 24,288. So the
+window is a parameter (`WIN`, `CPU_WIN` on the SoC), 1 on the Sergei
+boards and 0 on Lakritz, where the decoder is the old one less the
+wait for the attribute ROM. `make check-b-nowin` runs the core
+without it in lockstep.
+
+#### A read-modify-write that faults
+
+A new case in the paging test found a fault that had been there
+since round 29: `ADD [mem], reg` and its kin are a load-and-operate
+followed by a store, and with paging the page was looked up as for
+a read at the first and as for a write only at the second. A write
+to a read-only page therefore faulted after the flags had been
+changed, and the handler saw the wrong flags (for `ADC` and `SBB`
+the instruction, run again, would have used the wrong carry). The
+load-and-operate of such an instruction is now looked up as a write,
+as a plain load already was (`mark_rmw` in the microassembler marks
+both kinds). `CMP` with memory, which never writes, no longer stores
+back what it read.
+
+#### The clock
+
+The address of a micro-operation's memory access is the last thing
+to arrive in the core's longest cycle, and on its way to the bus
+register it passed one multiplexer for every other user of the bus
+(the decoder, the paging unit, the DMA fetch): each was written
+later in the Verilog block and so had priority. It is assigned last
+now, since no other user is at work in a cycle a micro-operation
+runs. Sergei routes at 34.6 MHz for the 33.16 MHz target (33.9 in
+round 31).
+
 ## Known limits
 
-1. **Block RAM on Lakritz.** All 56 blocks are used. The microcode
-   ROM has room (1,397 of 2,048 words used), but anything else that
-   wants a block has to take it from something.
+1. **Lakritz is full.** All 56 block RAMs are used, and all but a
+   few hundred LUTs: the decoder's window ([round 32](#round-32)) is
+   left out there. The microcode ROM has room (1,417 of 2,048 words
+   used), but anything else that wants a block has to take it from
+   something.
 2. **Self-modifying code** is handled exactly, but two windows
    remain. A store takes effect on the cache at the end of the
    instruction that makes it, so an instruction that overwrites the

@@ -336,7 +336,8 @@ static void compare(const pc *a)
  * the ModRM reg field for the group opcodes, and whether the operand
  * is memory. REP is kept apart. */
 static int prof_on = -1;
-static struct { unsigned long long n, cyc; } prof[2][2][0x200][9];
+static struct { unsigned long long n, cyc, dec; } prof[2][2][0x200][9];
+static unsigned long long prof_from, prof_hist[40];
 static int prof_rep, prof_mem, prof_op, prof_sub;
 
 static void prof_key(pc *a)
@@ -374,7 +375,7 @@ static void prof_key(pc *a)
 
 static void prof_report(void)
 {
-    struct row { int rep, mem, op, sub; unsigned long long n, cyc; };
+    struct row { int rep, mem, op, sub; unsigned long long n, cyc, dec; };
     std::vector<row> rows;
     unsigned long long total = 0, count = 0;
     for (int r = 0; r < 2; r++)
@@ -382,30 +383,41 @@ static void prof_report(void)
             for (int o = 0; o < 0x200; o++)
                 for (int g = 0; g < 9; g++)
                     if (prof[r][m][o][g].n) {
-                        rows.push_back({r, m, o, g, prof[r][m][o][g].n, prof[r][m][o][g].cyc});
+                        rows.push_back({r, m, o, g, prof[r][m][o][g].n, prof[r][m][o][g].cyc, prof[r][m][o][g].dec});
                         total += prof[r][m][o][g].cyc;
                         count += prof[r][m][o][g].n;
                     }
     std::sort(rows.begin(), rows.end(),
               [](const row &x, const row &y) { return x.cyc > y.cyc; });
     fprintf(stderr, "profile: %llu instructions, %llu cycles\n"
-                    "  opcode        count  share  cycles  share  each\n", count, total);
+                    "  opcode        count  share  cycles  share  each  each without decoding\n", count, total);
     for (size_t k = 0; k < rows.size() && k < 60; k++) {
         const row &x = rows[k];
         char name[32];
         snprintf(name, sizeof name, "%s%s%02x%s%c %s", x.rep ? "rep " : "",
                  x.op >= 0x100 ? "0f " : "", x.op & 0xFF, x.sub < 8 ? "/" : "",
                  x.sub < 8 ? '0' + x.sub : ' ', x.mem ? "m" : "");
-        fprintf(stderr, "  %-12s %9llu %5.1f%% %9llu %5.1f%% %5.1f\n", name, x.n,
+        fprintf(stderr, "  %-12s %9llu %5.1f%% %9llu %5.1f%% %5.1f %5.2f\n", name, x.n,
                 100.0 * (double)x.n / (double)count, x.cyc,
-                100.0 * (double)x.cyc / (double)total, (double)x.cyc / (double)x.n);
+                100.0 * (double)x.cyc / (double)total, (double)x.cyc / (double)x.n,
+                (double)(x.cyc - x.dec) / (double)x.n);
     }
+    fprintf(stderr, "cycles per instruction, histogram:");
+    for (int k = 1; k < 40; k++)
+        if (prof_hist[k])
+            fprintf(stderr, " %d%s:%.1f%%", k, k == 39 ? "+" : "",
+                    100.0 * (double)prof_hist[k] / (double)count);
+    fprintf(stderr, "\n");
 }
 
 void lockstep_run(pc *a, uint64_t n)
 {
-    if (prof_on < 0)
+    if (prof_on < 0) {
         prof_on = getenv("LOCKSTEP_PROFILE") != NULL;
+        /* LOCKSTEP_PROFILE=n: the profile and the counts start after n
+         * steps, to look at one part of a run. */
+        prof_from = prof_on ? strtoull(getenv("LOCKSTEP_PROFILE"), NULL, 0) : 0;
+    }
     while (n > 0 && !pc_stopped(a)) {
         /* The model's machine: one step of pc_run. */
         int a_idle = a->cpu.halted && !a->cpu.irq;
@@ -413,6 +425,13 @@ void lockstep_run(pc *a, uint64_t n)
             return;
         if (prof_on)
             prof_key(a);
+#ifdef CORE_B
+        if (prof_on && prof_from > 1 && steps_run == prof_from)
+            cycles = insns = st_decode = st_miss = st_probe = st_probes = st_kill = 0;
+        unsigned long long dec0 = st_decode;
+#else
+        unsigned long long dec0 = 0, st_decode = 0;
+#endif
         unsigned long long cyc0 = cycles;
         pc_run(a, 1);
 
@@ -461,9 +480,12 @@ void lockstep_run(pc *a, uint64_t n)
                                     (uint8_t)(top->d_wdata >> (8 * i)));
 #endif
         }
-        if (prof_on && cycles != cyc0) {
+        if (prof_on && cycles != cyc0 && steps_run >= prof_from) {
             prof[prof_rep][prof_mem][prof_op][prof_sub].n++;
             prof[prof_rep][prof_mem][prof_op][prof_sub].cyc += cycles - cyc0;
+            prof[prof_rep][prof_mem][prof_op][prof_sub].dec += st_decode - dec0;
+            unsigned long long k = cycles - cyc0 - (st_decode - dec0);
+            prof_hist[k > 39 ? 39 : k]++;
         }
         pc_devices(&B, steps);
         steps_run++;

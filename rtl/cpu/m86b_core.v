@@ -108,6 +108,10 @@
 module m86b_core #(
     parameter DC_AW = 11,
     parameter UC_AW = 11,
+    // The decoder's window (see below): 1 with it, 0 without. It makes
+    // an instruction's first execution about twice as fast and costs
+    // about 600 LUTs, which Lakritz does not have.
+    parameter WIN   = 1,
     parameter UCODE = "ucode.hex",
     parameter ATTR  = "attr.hex"
 ) (
@@ -423,8 +427,10 @@ module m86b_core #(
     reg  [17:0] attr_q;
     reg  [9:0]  attr_a;
     initial $readmemh(ATTR, attr);
+    // (Read in the very cycle the opcode byte is seen: attr_ra.)
+    wire [9:0]  attr_ra;
     always @(posedge clk)
-        attr_q <= attr[attr_a];
+        attr_q <= attr[attr_ra];
 
     // Which 64-byte blocks of memory hold cached instructions, by
     // generation. Generation 0 means none.
@@ -792,7 +798,13 @@ module m86b_core #(
     wire [31:0] va = (u_hi[0] ? {24'd0, ra[15:8]} : ra) & smask;
     wire [31:0] vb = (u_hi[1] ? {24'd0, rb[15:8]} : rb) & smask;
     wire [31:0] vc = (u_hi[3] ? {24'd0, rc[15:8]} : rc) & smask;
-    wire [31:0] vm = d_rdata & smask;
+    // What a memory access is wide: the size; 16 bits with cc bit 2;
+    // and a byte for a LOAD with aop bit 0, which then fills the
+    // register's whole size with it, zero-extended (MOVZX).
+    wire        ld_b   = (u_unit == U_LOAD) && u_aop[0];
+    wire [1:0]  m_size = ld_b ? 2'd0 : u_cc[2] ? 2'd1 : u_size;
+    wire [31:0] vm = d_rdata & (ld_b ? 32'h000000FF :
+                                (u_unit == U_LOAD && u_cc[2]) ? (smask & 32'h0000FFFF) : smask);
 
     // ---- address generation ----------------------------------------------
 
@@ -837,7 +849,7 @@ module m86b_core #(
     assign e_req  = valid && !stall && is_mem && !cyc2 && (u_unit != U_STORE) &&
                     (u_seg != 3'd7) && !pg;
     assign e_addr = lin;
-    assign e_size = u_cc[2] ? 2'd1 : u_size;
+    assign e_size = m_size;
 
     // The limit check is made a cycle later, from registers.
     reg        chk_v;
@@ -878,10 +890,13 @@ module m86b_core #(
 
     wire        op2    = p_loadop && cyc2;
     wire        swap   = u_cc[0];
+    // (A LOAD-OP with cc bit 3: memory and the immediate, in that
+    // order -- CMP, TEST and the rest with a memory operand.)
+    wire        ld_imm = p_loadop && u_cc[3];
     wire [31:0] alu_a  = op2 ? (swap ? vm : vc) : va;
     wire [31:0] alu_b  = p_one ? 32'd1 :
-                         op2 ? (swap ? vc : vm) :
-                         p_alui ? (imm & smask) : vb;
+                         (op2 && !ld_imm) ? (swap ? vc : vm) :
+                         (p_alui || ld_imm) ? (imm & smask) : vb;
     wire [31:0] alu_res, alu_sum, alu_other;
     wire        alu_cf, alu_of, alu_af, alu_zf, alu_sf, alu_pf;
     m86b_alu alu (
@@ -986,18 +1001,23 @@ module m86b_core #(
                SP_DIVQ = 4'd14, SP_DIVR = 4'd15;
 
     // ---- divider ----
-    // DIVGO divides {A, B} by C, unsigned, a bit a cycle: as many
-    // cycles as the size has bits. Microcode has made sure that A is
+    // DIVGO divides {A, B} by C, unsigned, two bits a cycle (two
+    // subtractions one after the other): half as many cycles as the
+    // size has bits. Microcode has made sure that A is
     // below C, so the quotient fits. DIVQ and DIVR read the quotient
     // and the remainder afterwards.
     reg  [31:0] dv_r, dv_q, dv_d, dv_mask;
     reg  [5:0]  dv_n;
     reg         dv_run;
     wire        is_div  = (u_unit == U_SPEC) && (u_aop == SP_DIVGO);
-    wire        dv_last = dv_run && (dv_n == 6'd1);
+    wire        dv_last = dv_run && (dv_n == 6'd2);
     wire        dv_msb  = (dv_mask[31]) ? dv_q[31] : (dv_mask[15]) ? dv_q[15] : dv_q[7];
+    wire        dv_msb2 = (dv_mask[31]) ? dv_q[30] : (dv_mask[15]) ? dv_q[14] : dv_q[6];
     wire [32:0] dv_sh   = {dv_r, dv_msb};
     wire [32:0] dv_df   = dv_sh - {1'b0, dv_d};
+    wire [31:0] dv_r1   = dv_df[32] ? dv_sh[31:0] : dv_df[31:0];
+    wire [32:0] dv_sh2  = {dv_r1, dv_msb2};
+    wire [32:0] dv_df2  = dv_sh2 - {1'b0, dv_d};
     always @(posedge clk) begin
         if (rst || !valid || !is_div)
             dv_run <= 1'b0;
@@ -1009,9 +1029,9 @@ module m86b_core #(
             dv_mask <= smask;
             dv_n    <= {bytes, 3'd0};
         end else begin
-            dv_r <= dv_df[32] ? dv_sh[31:0] : dv_df[31:0];
-            dv_q <= {dv_q[30:0], !dv_df[32]};
-            dv_n <= dv_n - 6'd1;
+            dv_r <= dv_df2[32] ? dv_sh2[31:0] : dv_df2[31:0];
+            dv_q <= {dv_q[29:0], !dv_df[32], !dv_df2[32]};
+            dv_n <= dv_n - 6'd2;
             if (dv_last)
                 dv_run <= 1'b0;
         end
@@ -1267,24 +1287,44 @@ module m86b_core #(
     localparam [3:0] DS_IDLE = 4'd0, DS_PFX = 4'd1, DS_ATTR = 4'd2, DS_OPC = 4'd3,
                      DS_MODRM = 4'd4, DS_SIB = 4'd5, DS_DISP = 4'd6, DS_ATTR2 = 4'd7,
                      DS_IMMGO = 4'd8, DS_IMM = 4'd9, DS_IMM2 = 4'd10, DS_GO = 4'd11,
-                     DS_WAIT = 4'd12, DS_XL = 4'd13;
+                     DS_WAIT = 4'd12, DS_XL = 4'd13, DS_WOPC = 4'd14;
     reg [3:0]  ds /* verilator public_flat */;
     reg [3:0]  ds_next;
-    reg [31:0] d_ip;
     reg [3:0]  d_len;
+    // (Where the decoder is: the instruction's address and the bytes
+    // read so far.)
+    wire [31:0] d_ip = i_eip + {28'd0, d_len};
     reg        d_map;
     reg [7:0]  d_op, d_modrm, d_sib;
     reg        d_os32, d_as32, d_ovr_v, d_lock;
     reg [1:0]  d_rep;
     // LOCK is valid only on some memory forms. Opcode groups decide by
     // the ModRM reg field.
+    // ---- the decoder's window ----
+    // When the instruction's first eight bytes may all be read (they
+    // lie inside the code segment and, with paging, in one page) the
+    // decoder reads them as two words and takes the instruction's
+    // fields from those, in the cycle it knows where each is, instead
+    // of asking the bus for every field. win holds the seven bytes
+    // after the first (after the last prefix, if there are prefixes:
+    // each moves the window down a byte); w_n says how many are
+    // there; w2: the second word is still on its way. ModRM, SIB and
+    // displacement are taken together; wp is then where the immediate
+    // begins. A field that is not in the window is read the old way,
+    // as is all of an instruction whose eight bytes may not be read.
+    reg [55:0] win;
+    reg [2:0]  w_n, wp;
+    reg        wmode_r, w2;
+    wire       wmode = (WIN != 0) && wmode_r;
+    // The ModRM byte: the window's, in the cycle it is taken from there.
+    wire [7:0] mq = (ds == DS_OPC && wmode && attr_q[10]) ? win[7:0] : d_modrm;
     reg        grp_lock;
     always @* begin
         case (d_op)
-            8'h80, 8'h81, 8'h82, 8'h83: grp_lock = (d_modrm[5:3] != 3'd7);
-            8'hF6, 8'hF7: grp_lock = (d_modrm[5:3] == 3'd2 || d_modrm[5:3] == 3'd3);
-            8'hFE, 8'hFF: grp_lock = (d_modrm[5:3] < 3'd2);
-            8'hBA: grp_lock = !d_map || (d_modrm[5:3] >= 3'd5);
+            8'h80, 8'h81, 8'h82, 8'h83: grp_lock = (mq[5:3] != 3'd7);
+            8'hF6, 8'hF7: grp_lock = (mq[5:3] == 3'd2 || mq[5:3] == 3'd3);
+            8'hFE, 8'hFF: grp_lock = (mq[5:3] < 3'd2);
+            8'hBA: grp_lock = !d_map || (mq[5:3] >= 3'd5);
             default: grp_lock = 1'b1;
         endcase
     end
@@ -1292,8 +1332,8 @@ module m86b_core #(
     // no microcode words for the others.
     wire       grp_ud = (!d_map &&
                          (((d_op == 8'hC6 || d_op == 8'hC7 || d_op == 8'h8F) &&
-                           d_modrm[5:3] != 3'd0) ||
-                          (d_op == 8'hFE && d_modrm[5:3] > 3'd1))) ||
+                           mq[5:3] != 3'd0) ||
+                          (d_op == 8'hFE && mq[5:3] > 3'd1))) ||
                         // (0F 00, SLDT and its kin, LAR and LSL: protected mode only.)
                         (d_map && (d_op == 8'h00 || d_op == 8'h02 || d_op == 8'h03) &&
                          (!cr0[0] || fl[17])) ||
@@ -1302,13 +1342,13 @@ module m86b_core #(
     // looked at as they are decoded.
     wire       d_priv = d_map ? (d_op == 8'h06 || d_op == 8'h08 || d_op == 8'h09 ||
                                  d_op[7:2] == 6'b001000 ||
-                                 (d_op == 8'h00 && d_modrm[5:4] == 2'b01) ||
-                                 (d_op == 8'h01 && (d_modrm[5:4] == 2'b01 || d_modrm[5:4] == 2'b11)))
+                                 (d_op == 8'h00 && mq[5:4] == 2'b01) ||
+                                 (d_op == 8'h01 && (mq[5:4] == 2'b01 || mq[5:4] == 2'b11)))
                               : (d_op == 8'hF4);
     reg [2:0]  d_ovr;
     reg [31:0] d_disp, d_imm;
     reg        dreq_r, dwr_r;
-    wire       d_ismem = (d_modrm[7:6] != 2'd3);
+    wire       d_ismem = (mq[7:6] != 2'd3);
     wire [1:0] d_osz = d_os32 ? 2'd2 : 2'd1;
 
     assign d_req = dreq_r && !lim_now && !fetch_bad;
@@ -1318,7 +1358,7 @@ module m86b_core #(
 
     wire [3:0] lane_d = (u_size == 2'd0) ? (u_hi[2] ? 4'b0010 : 4'b0001) :
                         (u_size == 2'd1) ? 4'b0011 : 4'b1111;
-    wire      go = (ds == DS_GO);
+    wire      go = (ds == DS_GO) && !w2;
     // The string instructions: 6C-6F, A4-A7, AA-AF.
     wire       d_str = !d_map && (d_op[7:2] == 6'b011011 || d_op[7:2] == 6'b101001 ||
                                   d_op[7:1] == 7'b1010101 || d_op[7:2] == 6'b101011);
@@ -1452,14 +1492,14 @@ module m86b_core #(
     // Ask for instruction bytes. The request is made at once; whether
     // it may be made is checked in the next cycle, from registers, by
     // one comparator for all the places that fetch (fetch_bad).
-    wire [31:0] f_lin = cs_base + d_ip;
+    wire [31:0] f_lin = i_lin + {28'd0, d_len};
     task dfetch(input [1:0] size, input [3:0] next);
         begin
             d_size  <= size;
             ds_next <= next;
             if (pg) begin
                 // The paging unit first; DS_XL makes the request.
-                x_lin  <= cs_base + d_ip;
+                x_lin  <= f_lin;
                 x_cur  <= f_lin[31:12];
                 x_wr   <= 1'b0;  x_rmw <= 1'b0;  x_st <= 1'b0;
                 x_user <= (cpl == 2'd3);
@@ -1471,18 +1511,17 @@ module m86b_core #(
                 dreq_r  <= 1'b1;
                 dwr_r   <= 1'b0;
                 d_io    <= 1'b0;
-                d_addr  <= cs_base + d_ip;
+                d_addr  <= f_lin;
                 ds      <= DS_WAIT;
             end
         end
     endtask
 
     wire [2:0] f_bytes = (d_size == 2'd0) ? 3'd1 : (d_size == 2'd1) ? 3'd2 : 3'd4;
-    wire [31:0] f_data = (d_size == 2'd0) ? {24'd0, d_rdata[7:0]} :
-                         (d_size == 2'd1) ? {16'd0, d_rdata[15:0]} : d_rdata;
     // Group F6/F7 has an immediate only for TEST (ModRM reg 0 and 1).
-    wire [2:0] a_immk = (!d_map && d_op[7:1] == 7'b1111011 && d_modrm[5:3] > 3'd1)
+    wire [2:0] a_immk = (!d_map && d_op[7:1] == 7'b1111011 && mq[5:3] > 3'd1)
                         ? 3'd0 : attr_q[13:11];
+
 
     // An instruction longer than 15 bytes, or one that runs past the
     // end of the code segment, is a general protection fault.
@@ -1499,6 +1538,81 @@ module m86b_core #(
                         (d_size == 2'd1) ? cs_lim1 : cs_lim3;
     wire        fetch_bad = (ds == DS_WAIT) && dreq_r && !dwr_r &&
                             (f_len > 5'd15 || f_lim[32] || d_ip > f_lim[31:0]);
+
+    // The opcode byte (or a prefix): from the bus as the first word
+    // arrives, from the window after a prefix. The attribute ROM is
+    // read with it at once, and for the memory or register form by
+    // the byte after it, which is the ModRM byte if there is one
+    // (opcodes without one have the same word for both forms).
+    wire        bus_ok  = (ds == DS_WAIT) && !fetch_bad && d_ack;
+    wire        w_first = wmode && (ds_next == DS_OPC);
+    wire        op_win  = (ds == DS_WOPC) && !w2 && (w_n >= 3'd2);
+    wire        op_now  = (bus_ok && ds_next == DS_OPC) || op_win;
+    wire [7:0]  ob      = (ds == DS_WOPC) ? win[7:0] : d_rdata[7:0];
+    wire        ob_mem  = (ds == DS_WOPC) ? (win[15:14] != 2'd3)
+                                          : (wmode && d_rdata[15:14] != 2'd3);
+    assign      attr_ra = ((ds == DS_WOPC) || ((ds == DS_WAIT) && (ds_next == DS_OPC)))
+                          ? {ob_mem, d_map, ob} : attr_a;
+    // ModRM, SIB and displacement, taken together.
+    wire [7:0]  wm     = win[7:0];
+    wire        w_hsib = d_as32 && (wm[7:6] != 2'd3) && (wm[2:0] == 3'd4);
+    wire        w_d32  = (wm[7:6] == 2'd2) ||
+                         (wm[7:6] == 2'd0 && (w_hsib ? (win[10:8] == 3'd5) : (wm[2:0] == 3'd5)));
+    wire        w_d16  = (wm[7:6] == 2'd2) || (wm[7:6] == 2'd0 && wm[2:0] == 3'd6);
+    // (The displacement's size as a bus size, and whether there is one.)
+    wire        w_dany = (wm[7:6] != 2'd3) && (wm[7:6] == 2'd1 || (d_as32 ? w_d32 : w_d16));
+    wire [1:0]  w_dsc  = (wm[7:6] == 2'd1) ? 2'd0 : d_as32 ? 2'd2 : 2'd1;
+    wire [2:0]  w_need1 = 3'd1 + {2'd0, w_hsib} +
+                          (!w_dany ? 3'd0 : (w_dsc == 2'd0) ? 3'd1 : (w_dsc == 2'd1) ? 3'd2 : 3'd4);
+    // The immediate: its size, and whether the window may give it (a
+    // far pointer and ENTER's two numbers go the old way).
+    wire [1:0]  w_isc  = (a_immk == 3'd1 || a_immk == 3'd4) ? 2'd0 :
+                         (a_immk == 3'd3) ? 2'd1 :
+                         (a_immk == 3'd2) ? (d_os32 ? 2'd2 : 2'd1) : (d_as32 ? 2'd2 : 2'd1);
+    wire [2:0]  w_isz  = (w_isc == 2'd0) ? 3'd1 : (w_isc == 2'd1) ? 3'd2 : 3'd4;
+    wire        w_iok  = (a_immk != 3'd0) && (a_immk != 3'd5) && (a_immk != 3'd7);
+    // The checks made once ModRM is known.
+    wire        ig_ud  = !attr_q[15] || grp_ud ||
+                         (d_lock && attr_q[10] && !(d_ismem && attr_q[17] && grp_lock));
+    wire        ig_gp  = d_priv && cr0[0] && cpl != 2'd0;
+    wire        ig_bad = ig_ud || ig_gp;
+    // In DS_OPC: ModRM and what belongs to it are in the window.
+    wire        w_mfit  = (ds == DS_OPC) && wmode && attr_q[15] && attr_q[10] &&
+                          (w_need1 <= w_n);
+    wire        w_mtake = w_mfit && !ig_bad;
+    // An opcode without ModRM goes on to its immediate in DS_OPC itself.
+    wire        at_immgo = (ds == DS_IMMGO) ||
+                           ((ds == DS_OPC) && attr_q[15] && !attr_q[10] && !d_lock);
+    wire [3:0]  w_iend  = {1'b0, wp} + {1'b0, w_isz};
+    wire        w_itake = at_immgo && !ig_bad && wmode && w_iok && (w_iend <= {1'b0, w_n});
+    // What the window gives: the displacement (after ModRM, or after
+    // SIB) or the immediate (at wp).
+    wire [2:0]  w_off = (ds == DS_OPC && attr_q[10]) ? (w_hsib ? 3'd2 : 3'd1) : wp;
+    reg  [31:0] w_at;
+    always @* begin
+        case (w_off)
+            3'd0:    w_at = win[31:0];
+            3'd1:    w_at = win[39:8];
+            3'd2:    w_at = win[47:16];
+            3'd3:    w_at = win[55:24];
+            3'd5:    w_at = {16'd0, win[55:40]};
+            default: w_at = {24'd0, win[55:48]};
+        endcase
+    end
+    // What a fetch gave, whichever way: cut to its size.
+    wire        f_win  = w_mtake || w_itake;
+    wire [31:0] f_raw  = f_win ? w_at : d_rdata;
+    wire [1:0]  f_szc  = w_mtake ? w_dsc : w_itake ? w_isc : d_size;
+    wire [31:0] f_data = (f_szc == 2'd0) ? {24'd0, f_raw[7:0]} :
+                         (f_szc == 2'd1) ? {16'd0, f_raw[15:0]} : f_raw;
+    wire        disp_now = (bus_ok && ds_next == DS_DISP) || (w_mtake && w_dany);
+    wire        imm_now  = (bus_ok && ds_next == DS_IMM) || w_itake;
+    // The first fetch may be the window's.
+    reg  [32:0] cs_lim7;
+    always @(posedge clk)
+        cs_lim7 <= {1'b0, cs_lim} - 33'd7;
+    wire        w_can = (WIN != 0) && !cs_lim7[32] && (lk_eip <= cs_lim7[31:0]) &&
+                        !(pg && lk_lin[11:0] > 12'hFF8);
 
     // A load of SS, or STI when interrupts were off.
     wire set_inh = valid && !stall && u_unit == U_SPEC &&
@@ -1546,6 +1660,7 @@ module m86b_core #(
             gate_trap <= 1'b0; tr_base <= 32'd0; tr_32 <= 1'b0; sel_null <= 1'b0; chk_bad <= 1'b0;
             gdt_base <= 32'd0; gdt_lim <= 16'hFFFF; idt_base <= 32'd0; idt_lim <= 16'hFFFF;
             dreq_r <= 1'b0; dwr_r <= 1'b0; ds <= DS_IDLE; i_first <= 1'b0;
+            wmode_r <= 1'b0; w2 <= 1'b0;
             inh <= 1'b0; inh_next <= 1'b0; d_io <= 1'b0; inta <= 1'b0;
             flushing <= 1'b0;
             pr_v <= 1'b0; pq_v <= 1'b0; probing <= 1'b0; p_ev <= 1'b0; p_restore <= 1'b0;
@@ -1702,7 +1817,7 @@ module m86b_core #(
                 if (vm_int) begin fl[17] <= 1'b1; vm_int <= 1'b0; end
                 in_rom <= 1'b1; lk_pend <= 1'b0; s1_v <= 1'b1; s2_v <= 1'b0;
                 cyc2 <= 1'b0; cyc3 <= 1'b0; ds <= DS_IDLE; i_first <= 1'b0;
-                dreq_r <= 1'b0;
+                dreq_r <= 1'b0; wmode_r <= 1'b0; w2 <= 1'b0;
             end else if (irq_take) begin
                 // Deliver an interrupt: microcode, returning to the
                 // instruction that was about to run.
@@ -1726,12 +1841,34 @@ module m86b_core #(
                 in_rom <= 1'b1; lk_pend <= 1'b0; s1_v <= 1'b0; s2_v <= 1'b0;
                 cyc2 <= 1'b0; cyc3 <= 1'b0;
                 i_eip <= lk_eip; i_lin <= lk_lin;
-                d_ip <= lk_eip; d_len <= 4'd0; d_map <= 1'b0;
+                d_len <= 4'd0; d_map <= 1'b0;
                 esp0 <= esp_now;
                 d_os32 <= cs_d; d_as32 <= cs_d; d_ovr_v <= 1'b0; d_lock <= 1'b0;
                 d_rep <= 2'd0;
                 d_modrm <= 8'hC0; d_sib <= 8'd0; d_disp <= 32'd0; d_imm <= 32'd0;
-                ds <= DS_PFX;
+                // The first fetch, at once: the window's first word if
+                // the window may be read, or one byte.
+                wmode_r <= w_can;  w2 <= 1'b0;  wp <= 3'd0;
+                d_size  <= w_can ? 2'd2 : 2'd0;
+                ds_next <= DS_OPC;
+                if (WIN == 0)
+                    ds     <= DS_PFX;           // (without the window: a cycle later)
+                else if (pg) begin
+                    x_lin  <= lk_lin;
+                    x_cur  <= lk_lin[31:12];
+                    x_wr   <= 1'b0;  x_rmw <= 1'b0;  x_st <= 1'b0;
+                    x_user <= (cpl == 2'd3);
+                    x_size <= w_can ? 2'd2 : 2'd0;
+                    x_dec  <= 1'b1;  x_second <= 1'b0;  x_io <= 2'd0;
+                    xs     <= X_LOOK;
+                    ds     <= DS_XL;
+                end else begin
+                    dreq_r <= 1'b1;
+                    dwr_r  <= 1'b0;
+                    d_io   <= 1'b0;
+                    d_addr <= lk_lin;
+                    ds     <= DS_WAIT;
+                end
             end else if (valid && !stall) begin
                 if (hot && !cyc2 && !cyc3) begin
                     i_eip <= lk_eip; i_lin <= lk_lin;
@@ -1744,8 +1881,8 @@ module m86b_core #(
                     dreq_r  <= 1'b1;
                     d_io    <= (u_seg == 3'd7) || (pg && x_cross);
                     dwr_r   <= (u_unit == U_STORE);
-                    d_addr  <= (pg && u_seg != 3'd7) ? x_addr : lin;
-                    d_size  <= u_cc[2] ? 2'd1 : u_size;
+                    // (d_addr: at the end of this block.)
+                    d_size  <= m_size;
                     d_wdata <= st_data;
                     chk_v     <= 1'b1;
                     chk_off   <= off;
@@ -1753,7 +1890,7 @@ module m86b_core #(
                     // used this way, or the port not at this level.)
                     chk_lim   <= acc_bad ? 33'h1_0000_0000 :
                                  {1'b0, seg_lim[u_seg]} -
-                                 {31'd0, u_cc[2] ? 2'd1 : (bytes[1:0] - 2'd1)};
+                                 {31'd0, m_size[1], m_size[1] | m_size[0]};
                     chk_bad   <= acc_bad;
                     chk_ss    <= (u_seg == 3'd2);
                 end
@@ -1993,6 +2130,15 @@ module m86b_core #(
             end
 
             // ---- the decoder ----
+            // The window's second word arrives.
+            if (w2) begin
+                if (d_ack) begin
+                    w2  <= 1'b0;
+                    win[55:24] <= d_rdata;
+                    w_n <= w_n + 3'd4;
+                end else if (!flt_now)
+                    dreq_r <= 1'b1;
+            end
             if (!flt_now) case (ds)
                 DS_PFX: dfetch(2'd0, DS_OPC);
                 DS_XL: if (xs == X_RDY) begin
@@ -2015,66 +2161,60 @@ module m86b_core #(
                     dreq_r <= 1'b1;
                 else begin
                     dreq_r <= 1'b0;
-                    d_ip   <= d_ip + {29'd0, f_bytes};
                     d_len  <= d_len + {1'b0, f_bytes};
                     ds     <= ds_next;
+                    if (w_first) begin
+                        // The window's first word: its first byte is
+                        // looked at now (below), the rest kept, and
+                        // the second word asked for.
+                        d_len  <= d_len + 4'd1;
+                        win[23:0] <= d_rdata[31:8];
+                        w_n    <= 3'd3;
+                        w2     <= 1'b1;
+                        dreq_r <= 1'b1;
+                        d_addr <= d_addr + 32'd4;
+                    end
                     case (ds_next)
-                        DS_OPC: begin
-                            case (f_data[7:0])
-                                8'h26: begin d_ovr_v <= 1; d_ovr <= 3'd0; ds <= DS_PFX; end
-                                8'h2E: begin d_ovr_v <= 1; d_ovr <= 3'd1; ds <= DS_PFX; end
-                                8'h36: begin d_ovr_v <= 1; d_ovr <= 3'd2; ds <= DS_PFX; end
-                                8'h3E: begin d_ovr_v <= 1; d_ovr <= 3'd3; ds <= DS_PFX; end
-                                8'h64: begin d_ovr_v <= 1; d_ovr <= 3'd4; ds <= DS_PFX; end
-                                8'h65: begin d_ovr_v <= 1; d_ovr <= 3'd5; ds <= DS_PFX; end
-                                8'h66: begin d_os32 <= !cs_d; ds <= DS_PFX; end
-                                8'h67: begin d_as32 <= !cs_d; ds <= DS_PFX; end
-                                8'hF0: begin d_lock <= 1; ds <= DS_PFX; end
-                                8'hF2, 8'hF3: begin d_rep <= {!f_data[0], 1'b1}; ds <= DS_PFX; end
-                                8'h0F: begin d_map <= 1; ds <= DS_PFX; end
-                                default: begin
-                                    d_op   <= f_data[7:0];
-                                    attr_a <= {1'b0, d_map, f_data[7:0]};
-                                    ds     <= DS_ATTR;
-                                end
-                            endcase
-                        end
                         DS_MODRM: begin
                             d_modrm <= f_data[7:0];
                             attr_a  <= {f_data[7:6] != 2'd3, d_map, d_op};
                         end
                         DS_SIB:  d_sib  <= f_data[7:0];
-                        DS_DISP: begin
-                            d_disp <= (d_modrm[7:6] == 2'd1) ? {{24{f_data[7]}}, f_data[7:0]}
-                                                            : f_data;
-                            ds <= DS_ATTR2;
-                        end
-                        DS_IMM: begin
-                            if (a_immk == 3'd6) begin
-                                // A bare offset: make it a ModRM
-                                // operand with only a displacement.
-                                d_disp  <= f_data;
-                                d_modrm <= d_as32 ? 8'h05 : 8'h06;
-                            end
-                            d_imm <= (a_immk == 3'd4) ? {{24{f_data[7]}}, f_data[7:0]} :
-                                     (a_immk == 3'd2 && !d_os32 && attr_q[17])
-                                         ? {{16{f_data[15]}}, f_data[15:0]} : f_data;
-                            // A far pointer's selector follows its offset.
-                            ds <= (a_immk == 3'd5 || a_immk == 3'd7) ? DS_IMM2 : DS_GO;
-                        end
+                        DS_DISP: ds <= DS_ATTR2;            // (the displacement: below)
                         DS_GO: d_disp <= f_data;
-                        default: ;
+                        default: ;                          // (opcode, immediate: below)
                     endcase
                 end
-                DS_ATTR: ds <= DS_OPC;          // the attribute word arrives
-                DS_OPC: begin
-                    if (!attr_q[15] || (d_lock && !attr_q[10])) begin
+                // After a prefix, in the window: the next byte (below),
+                // if it and the one after it are there.
+                DS_WOPC: if (!w2 && w_n < 3'd2) begin
+                    wmode_r <= 1'b0;
+                    ds    <= DS_PFX;
+                end
+                // The attribute word is here. (Nothing is raised and
+                // nothing else asked of the bus while the window's
+                // second word is on its way.)
+                DS_OPC: if (!attr_q[15] || (d_lock && !attr_q[10])) begin
+                    if (!w2) begin
                         ud_now <= 1'b1;
                         ds <= DS_IDLE;
-                    end else if (attr_q[10])
-                        dfetch(2'd0, DS_MODRM);
-                    else
-                        ds <= DS_IMMGO;
+                    end
+                end else if (w_mfit) begin
+                    if (!ig_bad) begin
+                        // ModRM, SIB and displacement from the window.
+                        d_modrm <= wm;
+                        if (w_hsib) d_sib <= win[15:8];
+                        wp    <= w_need1;
+                        d_len <= d_len + {1'b0, w_need1};
+                        ds    <= (a_immk == 3'd0) ? DS_GO : DS_IMMGO;
+                    end else if (!w2) begin
+                        ud_now <= 1'b1;
+                        if (!ig_ud) ud_vec <= 8'd13;
+                        ds <= DS_IDLE;
+                    end
+                end else if (attr_q[10] && !w2) begin
+                    wmode_r <= 1'b0;
+                    dfetch(2'd0, DS_MODRM);
                 end
                 DS_MODRM: begin
                     if (!d_ismem)
@@ -2103,24 +2243,9 @@ module m86b_core #(
                 // The selector of a far pointer, or ENTER's nesting level.
                 DS_IMM2: dfetch((a_immk == 3'd7) ? 2'd0 : 2'd1, DS_GO);
                 DS_ATTR2: ds <= DS_IMMGO;       // attributes of the memory or register form
-                DS_IMMGO: begin
-                    if (!attr_q[15] || grp_ud ||
-                        (d_lock && attr_q[10] && !(d_ismem && attr_q[17] && grp_lock))) begin
-                        ud_now <= 1'b1;
-                        ds <= DS_IDLE;
-                    end else if (d_priv && cr0[0] && cpl != 2'd0) begin
-                        ud_now <= 1'b1;
-                        ud_vec <= 8'd13;
-                        ds <= DS_IDLE;
-                    end else case (a_immk)
-                        3'd0: ds <= DS_GO;
-                        3'd1, 3'd4: dfetch(2'd0, DS_IMM);
-                        3'd2, 3'd5: dfetch(d_osz, DS_IMM);
-                        3'd3, 3'd7: dfetch(2'd1, DS_IMM);
-                        default: dfetch(d_as32 ? 2'd2 : 2'd1, DS_IMM);
-                    endcase
-                end
-                DS_GO: begin
+                DS_IMMGO: ;                     // (below)
+                DS_GO: if (!w2) begin
+
                     // Start the instruction's microcode; its first uop
                     // will be cached on the way.
                     i_imm  <= d_imm;
@@ -2135,6 +2260,73 @@ module m86b_core #(
                 end
                 default: ;
             endcase
+
+            // The opcode byte, or a prefix.
+            if (!flt_now && op_now) begin
+                if (ds == DS_WOPC) begin
+                    win   <= {8'd0, win[55:8]};
+                    w_n   <= w_n - 3'd1;
+                    d_len <= d_len + 4'd1;
+                end
+                ds <= wmode ? DS_WOPC : DS_PFX;
+                case (ob)
+                    8'h26: begin d_ovr_v <= 1; d_ovr <= 3'd0; end
+                    8'h2E: begin d_ovr_v <= 1; d_ovr <= 3'd1; end
+                    8'h36: begin d_ovr_v <= 1; d_ovr <= 3'd2; end
+                    8'h3E: begin d_ovr_v <= 1; d_ovr <= 3'd3; end
+                    8'h64: begin d_ovr_v <= 1; d_ovr <= 3'd4; end
+                    8'h65: begin d_ovr_v <= 1; d_ovr <= 3'd5; end
+                    8'h66: d_os32 <= !cs_d;
+                    8'h67: d_as32 <= !cs_d;
+                    8'hF0: d_lock <= 1;
+                    8'hF2, 8'hF3: d_rep <= {!ob[0], 1'b1};
+                    8'h0F: d_map <= 1;
+                    default: begin
+                        // (The attribute word is being read already.)
+                        d_op   <= ob;
+                        attr_a <= {ob_mem, d_map, ob};
+                        ds     <= DS_OPC;
+                    end
+                endcase
+            end
+            // What follows the opcode and ModRM: the immediate.
+            if (!flt_now && at_immgo) begin
+                if (ig_bad) begin
+                    if (!w2) begin
+                        ud_now <= 1'b1;
+                        if (!ig_ud) ud_vec <= 8'd13;
+                        ds <= DS_IDLE;
+                    end
+                end else if (a_immk == 3'd0)
+                    ds <= DS_GO;
+                else if (w_itake)
+                    d_len <= d_len + {1'b0, w_isz};     // from the window (below)
+                else if (!w2) begin
+                    wmode_r <= 1'b0;
+                    case (a_immk)
+                        3'd1, 3'd4: dfetch(2'd0, DS_IMM);
+                        3'd2, 3'd5: dfetch(d_osz, DS_IMM);
+                        3'd3, 3'd7: dfetch(2'd1, DS_IMM);
+                        default: dfetch(d_as32 ? 2'd2 : 2'd1, DS_IMM);
+                    endcase
+                end
+            end
+            // The displacement and the immediate, from the bus or the window.
+            if (!flt_now && disp_now)
+                d_disp <= (mq[7:6] == 2'd1) ? {{24{f_data[7]}}, f_data[7:0]} : f_data;
+            if (!flt_now && imm_now) begin
+                if (a_immk == 3'd6) begin
+                    // A bare offset: make it a ModRM operand with
+                    // only a displacement.
+                    d_disp  <= f_data;
+                    d_modrm <= d_as32 ? 8'h05 : 8'h06;
+                end
+                d_imm <= (a_immk == 3'd4) ? {{24{f_data[7]}}, f_data[7:0]} :
+                         (a_immk == 3'd2 && !d_os32 && attr_q[17])
+                             ? {{16{f_data[15]}}, f_data[15:0]} : f_data;
+                // A far pointer's selector follows its offset.
+                ds <= (a_immk == 3'd5 || a_immk == 3'd7) ? DS_IMM2 : DS_GO;
+            end
 
             // ---- the paging unit ----
             if (done || flt_now || irq_take) un_new <= 1'b1;
@@ -2172,10 +2364,13 @@ module m86b_core #(
                     if (!relatch) begin
                         x_lin  <= lin;
                         x_cur  <= lin[31:12];
-                        x_wr   <= (u_unit == U_STORE) || (u_unit == U_LOAD && u_aop[3]);
+                        x_wr   <= (u_unit == U_STORE) || (u_unit == U_LOAD && u_aop[3]) ||
+                                  (u_unit == U_LOADOP && u_cc[1]);
                         // (aop 8: a read-modify-write's read; 12: a look
-                        // ahead of a write, which is treated as the write.)
-                        x_rmw  <= (u_unit == U_LOAD && u_aop[3] && !u_aop[2]);
+                        // ahead of a write, which is treated as the write.
+                        // A LOAD-OP says the first with cc bit 1.)
+                        x_rmw  <= (u_unit == U_LOAD && u_aop[3] && !u_aop[2]) ||
+                                  (u_unit == U_LOADOP && u_cc[1]);
                         // (On the way to an inner level the pushes are
                         // already that level's.)
                         x_user <= (cpl == 2'd3) && (tpl == 2'd3) && (u_seg != 3'd6);
@@ -2186,7 +2381,7 @@ module m86b_core #(
                         chk_off <= off;
                         chk_lim <= acc_bad ? 33'h1_0000_0000 :
                                    {1'b0, seg_lim[u_seg]} -
-                                   {31'd0, u_cc[2] ? 2'd1 : (bytes[1:0] - 2'd1)};
+                                   {31'd0, m_size[1], m_size[1] | m_size[0]};
                         chk_bad <= acc_bad;
                         chk_ss  <= (u_seg == 3'd2);
                         xs <= X_LOOK;
@@ -2362,6 +2557,13 @@ module m86b_core #(
                 end else
                     gen <= gen + 1'b1;
             end
+            // A uop's memory access: its address to the bus. Written
+            // here, last, because the address is the last thing to
+            // arrive in the cycle and so should have one choice to
+            // pass, not one for every other user of the bus above
+            // (none of which is at work in a cycle a uop runs).
+            if (valid && !stall && is_mem && !cyc2 && !relatch)
+                d_addr <= (pg && u_seg != 3'd7) ? x_addr : lin;
         end
     end
 

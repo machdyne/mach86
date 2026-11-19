@@ -146,6 +146,25 @@ $(BOUT)/rtlpcb: $(RTLB) $(BOUT)/ucode.hex m86pc.c pc.c vga.c sdcard.c m86cpu.c l
 	  $(CURDIR)/$(BOUT)/sdcard.o $(CURDIR)/$(BOUT)/m86cpu.o \
 	  $(CURDIR)/lockstep.cpp
 
+# The same core without the decoder's window (WIN = 0), as Lakritz
+# builds it.
+$(BOUT)/rtlpcb0: $(BOUT)/rtlpcb
+	@rm -f $(BOUT)/rtlpcb0
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86b_core $(VDEF) -GWIN=0 \
+	  -GUCODE='"$(CURDIR)/$(BOUT)/ucode.hex"' -GATTR='"$(CURDIR)/$(BOUT)/attr.hex"' \
+	  -Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-BLKSEQ -Wno-UNUSED \
+	  -Wno-CASEOVERLAP -Wno-UNOPTFLAT -Wno-LATCH -Wno-MULTIDRIVEN \
+	  -CFLAGS "-O2 -DCORE_B -I$(CURDIR)" --Mdir $(BOUT)/obj_pc0 -o ../rtlpcb0 \
+	  $(RTLB) $(CURDIR)/$(BOUT)/m86pc.o $(CURDIR)/$(BOUT)/pc.o $(CURDIR)/$(BOUT)/vga.o \
+	  $(CURDIR)/$(BOUT)/sdcard.o $(CURDIR)/$(BOUT)/m86cpu.o \
+	  $(CURDIR)/lockstep.cpp
+
+check-b-nowin: all $(BOUT)/rtlpcb0 $(OUT)/boottest.bin
+	cp $(OUT)/boottest.bin $(OUT)/boottest.img
+	$(BOUT)/rtlpcb0 -bios $(BIOS) -disk $(OUT)/boottest.img -max 200000000 \
+	  -expect "type something" -type "hello\r" -expect "boot test passed"
+	@echo "design B without the decoder's window: BIOS boot test passes in lockstep with the model"
+
 # Design B boots the BIOS test in lockstep with the model.
 check-b-boot: all $(BOUT)/rtlpcb $(OUT)/boottest.bin
 	cp $(OUT)/boottest.bin $(OUT)/boottest.img
@@ -398,7 +417,7 @@ $(SOCOUT)/soc_tb_nobram: $(RTLSOC) $(BIOS) soc_tb.cpp sdcard.c pc.h ../sw/ucode/
 	python3 ../tools/mkfont.py ../sw/font/font16.mem $(SOCOUT)/font.hex
 	$(CC) $(CFLAGS) -c -o $(SOCOUT)/sdcard.o sdcard.c
 	@rm -f $(SOCOUT)/soc_tb_nobram
-	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86_soc -GMAIN_MEM=1 -GEXT_KB=15360 -GVGA_EXT=1 -GVGA_BRAM=0 \
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86_soc -GMAIN_MEM=1 -GEXT_KB=15360 -GVGA_EXT=1 -GVGA_BRAM=0 -GCPU_WIN=0 \
 	  -GUCODE='"$(CURDIR)/$(SOCOUT)/ucode.hex"' -GATTR='"$(CURDIR)/$(SOCOUT)/attr.hex"' \
 	  -GROM0='"$(CURDIR)/$(SOCOUT)/rom0.hex"' -GROM1='"$(CURDIR)/$(SOCOUT)/rom1.hex"' \
 	  -GROM2='"$(CURDIR)/$(SOCOUT)/rom2.hex"' -GROM3='"$(CURDIR)/$(SOCOUT)/rom3.hex"' \
@@ -796,4 +815,4 @@ rtl-dos: all $(RTLOUT)/rtlpc $(OUT)/dostest.com
 clean:
 	rm -rf $(OUT) $(RTLOUT) $(BOUT)
 
-.PHONY: all check rtl-check profile vectors rtl-vectors vectors-b check-b-boot dos-b check-tb check-soc check-soc-main check-soc-train check-card check-pm check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse card soc-dos check-gate gate-dos sdcard dos rtl-dos clean
+.PHONY: all check check-b-nowin rtl-check profile vectors rtl-vectors vectors-b check-b-boot dos-b check-tb check-soc check-soc-main check-soc-train check-card check-pm check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse card soc-dos check-gate gate-dos sdcard dos rtl-dos clean

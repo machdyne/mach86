@@ -5,6 +5,7 @@
 | [running.md](running.md) | How to build it, put it on a board, and what should happen |
 | [boards.md](boards.md) | Lakritz and Sergei ML2: what they have and what Mach86 uses |
 | [cpu_b.md](cpu_b.md) | The CPU: decode once into block RAM, execute from there. Design, measurements |
+| [cpu_c.md](cpu_c.md) | A plan: a pipelined core for the 45F boards, aiming at a 486DX2/66's speed |
 | [pmode.md](pmode.md) | Protected mode: what is there, what is not |
 | [soc.md](soc.md) | The machine around the CPU, and how it is tested down to the synthesised netlist |
 | [hwmap.md](hwmap.md) | Memory map, I/O ports, interrupt lines |

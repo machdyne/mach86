@@ -104,14 +104,19 @@ yet; when it is, this table is replaced by its measurements.
 
 | | Lakritz build | Has |
 |---|---:|---:|
-| Logic cells | **22,500** (round 30; 19,900 before paging and virtual 8086 mode; the Sound Blaster took 130) | 24,288 (**92%**) |
+| Logic cells | **23,591** (round 32; 19,900 before paging and virtual 8086 mode) | 24,288 (**97%**) |
 | Block RAM | **56: all of them** (round 26) | 56 |
-| CPU clock | routed at 36.9 MHz (round 31, one seed, with the placer's timing weight raised as on the Sergei) | runs at 33.16 |
+| CPU clock | routed at 35.4 MHz (round 32, one seed, with the placer's timing weight raised as on the Sergei) | runs at 33.16 |
 
 Round 29 took 2,500 logic cells for paging, virtual 8086 mode and
-the I/O permission bitmap, and Lakritz is now nearly full: about
-1,800 cells are left after the Sound Blaster (round 30). Task
-switches, if they come, have to fit in that or take it from something.
+the I/O permission bitmap, and Lakritz is full: about 700 cells are
+left. Round 32's faster decoder (the window,
+[cpu_b.md](cpu_b.md#the-decoders-window)) did not fit by 34 cells and
+is left out of this build (`CPU_WIN(0)` in `rtl/boards/lakritz.v`);
+the round's other gains are in. Task switches, if they come, have
+to take their cells from something. Lakritz stays on design B: the
+faster core that is planned ([cpu_c.md](cpu_c.md)) is for the 45F
+boards.
 
 What is different from Sergei, underneath; a program sees the same
 machine:
@@ -166,7 +171,7 @@ design B at 31.5 MHz (33.16 in round 23's build), 64 MB of the DDR3 behind a 32 
 with 64 KB of video memory in block RAM on DDMI, a USB keyboard, a
 serial console, the SD card, a USB mouse, and the PC speaker and an
 AdLib on the optical output; video memory past 64 KB in the DDR3.
-17,500 logic cells of 43,848, 96 of 108 block RAMs. It runs on the board ([README](../README.md#status)).
+27,557 logic cells of 43,848 (62%) and 97 of 108 block RAMs in round 32, routed at 34.6 MHz. It runs on the board ([README](../README.md#status)).
 
 **The first test build** used none of the board's DDR3: 160 KB of
 RAM in block RAM, 8,000 logic cells and all 108 block RAMs, routed

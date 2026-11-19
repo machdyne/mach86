@@ -750,6 +750,20 @@ static uint32_t io_read(void *bus, uint16_t port, int size)
     uint32_t v = 0;
     for (int i = 0; i < size; i++)
         v |= (uint32_t)port_read8(bus, (uint16_t)(port + i)) << (8 * i);
+    /* M86_IO=n: after n instructions, say which ports are read and
+     * from where (the first 200 reads). */
+    {
+        static long long from = -2;
+        static int left = 200;
+        pc *p = bus;
+        if (from == -2)
+            from = getenv("M86_IO") ? atoll(getenv("M86_IO")) : -1;
+        if (from >= 0 && left > 0 && (long long)p->cpu.icount >= from) {
+            left--;
+            fprintf(stderr, "io: port %03x read %x at %04x:%08x\n", port, v,
+                    p->cpu.snap.seg[M86_CS].sel, p->cpu.snap.eip);
+        }
+    }
     return v;
 }
 

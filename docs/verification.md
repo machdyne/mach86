@@ -79,6 +79,31 @@ It ends with "no difference" after 79.7 million instructions, about
 ten minutes. A build with `VDEF=+define+M86_DBG` prints every fault
 the core takes, which is how the suite's failures were found.
 
+### Where the cycles go
+
+`LOCKSTEP_PROFILE=1` in the environment makes the lockstep bench end
+with a table by opcode: how often, how many cycles, cycles each with
+and without the decoder's, and a histogram of cycles an instruction.
+`LOCKSTEP_PROFILE=n` starts the table (and the bench's own counts)
+after n steps, to look at one part of a run: a game's play and not
+its start, say. Round 32's list was made with it
+([cpu_b.md](cpu_b.md#round-32)):
+
+```
+LOCKSTEP_PROFILE=620000000 output/b/rtlpcb -bios output/bios/bios.bin \
+  -disk card.img -expect "C:\>" -type "d:\r" -type "doom -nosound\r" \
+  -run 620000000
+```
+
+### Without the decoder's window
+
+Lakritz builds the core without the decoder's window (`WIN = 0`).
+`make check-b-nowin`, part of `make check`, boots the BIOS test on
+that core in lockstep, and `make check-nobram` runs the SoC as
+Lakritz builds it, without the window too. The DOS test, the
+protected-mode and paging tests and the 486 test were run on it by
+hand (`output/b/rtlpcb0` in place of `rtlpcb`).
+
 ### Requests from outside
 
 `M86B_DMA=n` in the environment makes the lockstep bench ask the

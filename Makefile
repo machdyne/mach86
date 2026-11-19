@@ -49,7 +49,7 @@ help:
 	@echo "  make synth-b      synthesise, place and route CPU design B"
 	@echo "                    for Lakritz's FPGA; report size and clock"
 
-check: check-docs check-sim check-rtl check-b check-b-boot check-tb check-soc check-486 check-pm check-pm2 check-pm3 check-pg check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse check-soc-train
+check: check-docs check-sim check-rtl check-b check-b-boot check-b-nowin check-tb check-soc check-486 check-pm check-pm2 check-pm3 check-pg check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse check-soc-train
 
 check-docs:
 	python3 tools/checkdocs.py
@@ -76,6 +76,9 @@ rtl-dos:
 # LOCKSTEP_MEM=1 in the environment also compares memory at every step.
 check-b-boot:
 	$(MAKE) -C sim check-b-boot
+
+check-b-nowin:
+	$(MAKE) -C sim check-b-nowin
 
 dos-b:
 	$(MAKE) -C sim dos-b

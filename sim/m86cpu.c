@@ -2530,16 +2530,19 @@ void m86_step(m86 *c)
         }
     }
     /* M86_DC=1: how a decoded-instruction cache of a few shapes would
-     * do on this program (misses per 100 million instructions). */
+     * do on this program (misses per cent, every 100 million
+     * instructions): 2,048, 4,096 and 8,192 entries indexed by the
+     * address's low bits; two ways of 1,024; and 2,048 and 4,096
+     * indexed by the low bits XOR the bits above them, three ways. */
     {
         static int on = -1;
-        static uint32_t *t[4];
+        static uint32_t *t[10];
         static uint8_t *lru;
-        static uint64_t n, miss[4];
+        static uint64_t n, miss[10];
         if (on < 0) {
             on = getenv("M86_DC") != NULL;
             if (on) {
-                for (int i = 0; i < 4; i++)
+                for (int i = 0; i < 10; i++)
                     t[i] = calloc(16384, sizeof(uint32_t));
                 lru = calloc(2048, 1);
             }
@@ -2563,10 +2566,27 @@ void m86_step(m86 *c)
                 lru[k] ^= 1;
                 miss[3]++;
             }
+            uint32_t l = lin - 1, rev = 0;
+            for (int b = 0; b < 11; b++)
+                rev |= ((l >> (11 + b)) & 1) << (10 - b);
+            uint32_t h[6] = {
+                (l ^ (l >> 11)) & 2047,             /* the next eleven bits */
+                (l ^ rev) & 2047,                   /* ... turned round */
+                (l ^ ((l >> 11) * 0x2F5)) & 2047,   /* ... multiplied */
+                (l ^ (l >> 12)) & 4095,
+                (l ^ (rev << 1)) & 4095,
+                (l ^ (((l >> 11) & 31) * 0x42)) & 2047 }; /* five bits only */
+            for (int i = 0; i < 6; i++)
+                if (t[4 + i][h[i]] != lin) {
+                    t[4 + i][h[i]] = lin;
+                    miss[4 + i]++;
+                }
             if (++n % 100000000 == 0) {
-                fprintf(stderr, "dc: %llu M instructions; misses per cent: 2048: %.2f  4096: %.2f  8192: %.2f  2x1024: %.2f\n",
-                        (unsigned long long)(n / 1000000), miss[0] / 1e6, miss[1] / 1e6, miss[2] / 1e6, miss[3] / 1e6);
-                miss[0] = miss[1] = miss[2] = miss[3] = 0;
+                fprintf(stderr, "dc: %llu M instructions; misses per cent: 2048: %.2f  4096: %.2f  8192: %.2f  2x1024: %.2f"
+                                "  2048 xor: %.2f  rev: %.2f  mul: %.2f  4096 xor: %.2f  rev: %.2f  2048 5-bit: %.2f\n",
+                        (unsigned long long)(n / 1000000), miss[0] / 1e6, miss[1] / 1e6, miss[2] / 1e6, miss[3] / 1e6,
+                        miss[4] / 1e6, miss[5] / 1e6, miss[6] / 1e6, miss[7] / 1e6, miss[8] / 1e6, miss[9] / 1e6);
+                memset(miss, 0, sizeof miss);
             }
         }
     }

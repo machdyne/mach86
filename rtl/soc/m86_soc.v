@@ -54,6 +54,7 @@ module m86_soc #(
     parameter ROM3 = "rom3.hex",
     parameter UCODE = "ucode.hex",
     parameter ATTR  = "attr.hex",
+    parameter CPU_WIN = 1,          // the CPU decoder's window (m86b_core.v): 0 on Lakritz, for want of LUTs
     parameter KBD_WAIT = 8192,
     parameter FONT = "font.hex",
     parameter HDMI_DEF = 1'b0          // port 1E1h bit 0 at power-on
@@ -175,7 +176,7 @@ module m86_soc #(
     wire        irq, inta;
     wire [7:0]  irq_vec;
 
-    m86b_core #(.UCODE(UCODE), .ATTR(ATTR)) cpu (
+    m86b_core #(.UCODE(UCODE), .ATTR(ATTR), .WIN(CPU_WIN)) cpu (
         .clk(clk), .rst(sys_rst),
         .d_req(d_req), .d_wr(d_wr), .d_addr(d_addr), .d_size(d_size),
         .d_wdata(d_wdata), .d_rdata(d_rdata), .d_ack(d_ack_cpu), .d_st_rdy(d_st_rdy),

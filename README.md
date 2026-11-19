@@ -32,7 +32,7 @@ and shares its licence; a few vendored files have their own
   640 x 480 in 16 colours and 320 x 200 in 256, on DVI/HDMI
   ([docs/video.md](docs/video.md)).
 - **Sound:** PC speaker, AdLib (OPL2) and a Sound Blaster (8-bit, DMA;
-  new and untested on a board), over HDMI, S/PDIF or a
+  it plays DOOM's effects on a board), over HDMI, S/PDIF or a
   one-pin sigma-delta output ([docs/sound.md](docs/sound.md)).
 - **Input:** USB keyboard and mouse, with an INT 33h mouse driver
   ([docs/mouse.md](docs/mouse.md)).
@@ -58,8 +58,8 @@ not there.
 
 | | |
 |---|---|
-| **Works on a Sergei ML2** | DOS boots from the card; the measured speed is what the simulation predicts (`SPEED` prints 21.4 million instructions a second on a plain loop at 33.16 MHz; 20.3 at 31.5 before); the display; DDR3 memory; PC speaker and AdLib sound right, over HDMI too; the Monkey Island demo runs, with music, under `SLOW 5`; **DOOM's shareware episode runs** (round 26, at 33 MHz, about ten frames a second by eye, sound not yet tried) |
-| **Passes in simulation, not confirmed on a board** | The 486 instructions and protected mode beyond what DOOM uses: privilege levels, paging and virtual 8086 mode (rounds 28 and 29; a 386 test suite passes on the core, and the Jemm386 memory manager runs DOS under it). Windows has not been tried anywhere. The Sound Blaster (round 30): its test and DOOM's sound run on the model and the simulated SoC. Also the mouse, the 640 x 350 and 640 x 480 modes, and the whole Lakritz build. The Konfekt and Mozart builds have not even been built into bitstreams. The USB keyboard has not been reported on either way |
+| **Works on a Sergei ML2** | DOS boots from the card; the measured speed is what the simulation predicts (`SPEED` prints 21.4 million instructions a second on a plain loop at 33.16 MHz; 20.3 at 31.5 before); the display; DDR3 memory; PC speaker and AdLib sound right, over HDMI too; the Monkey Island demo runs, with music, under `SLOW 5`; **DOOM's shareware episode runs** (round 26, at 33 MHz, about ten frames a second by eye; with Sound Blaster effects since round 30) |
+| **Passes in simulation, not confirmed on a board** | The 486 instructions and protected mode beyond what DOOM uses: privilege levels, paging and virtual 8086 mode (rounds 28 and 29; a 386 test suite passes on the core, and the Jemm386 memory manager runs DOS under it). Windows has not been tried anywhere. Round 32's faster decoder and shorter instructions: in lockstep with the model and on the simulated SoC only. Also the mouse, the 640 x 350 and 640 x 480 modes, and the whole Lakritz build. The Konfekt and Mozart builds have not even been built into bitstreams. The USB keyboard has not been reported on either way |
 | **Not tested at all** | Any DOS extender but DOS/4GW, any protected-mode program but DOOM and our own tests |
 | **Not there yet** | Task switches; an FPU; AdLib's rhythm mode; a mouse cursor in graphics modes |
 
@@ -69,6 +69,10 @@ not there.
   mode titles.
 - Fit a Machdyne Lakritz (ECP5 25F, 32 MB SDRAM). Development happens
   on Sergei ML2 (ECP5 45F, 512 MB DDR3L).
+- On the boards with a 45F: the speed of a 486DX2/66. That needs a
+  second, pipelined core, which is planned and not begun
+  ([docs/cpu_c.md](docs/cpu_c.md)); Lakritz stays on the core there
+  is, at 33 MHz.
 - Be a clean-room implementation, written from public specifications
   ([docs/cleanroom.md](docs/cleanroom.md)). Zeitlos code is the one
   exception, because it is ours.
@@ -76,7 +80,7 @@ not there.
   ([docs/software.md](docs/software.md)).
 
 Windows is not a goal. It is used as a stress test where it is cheap.
-An FPU is not planned for now.
+An FPU comes after the faster core, if at all.
 
 ## Building for a board
 

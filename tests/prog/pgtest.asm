@@ -12,7 +12,9 @@
 ;      the handler maps it, the instruction runs again;
 ;   5. the accessed and dirty bits;
 ;   6. a read-only page: level 0 writes it without CR0.WP and faults
-;      with it; INVLPG after the handler changes the entry;
+;      with it; INVLPG after the handler changes the entry; CMP and
+;      TEST with memory there do not fault; ADC and SBB that fault
+;      leave the carry alone and give the right sum when run again;
 ;   7. REP MOVSD into a page that is not present: the fault part of the
 ;      way, and the rest after the handler maps it;
 ;   8. paging off, and back to real mode.
@@ -180,13 +182,43 @@ pm32:   mov     ax, DATA32
         cmp     dword [pf_err], 3               ; present, a write
         jne     bad
 
+        ; 6b. Read only again. Reading is allowed, and a comparison
+        ; with memory is only a read ...
+        mov     dword [LIN + 3010h], 10h
+        call    protect_d
+        cmp     dword [LIN + 3010h], 10h
+        jne     bad
+        test    byte [LIN + 3010h], 10h
+        jz      bad
+        cmp     dword [faults], 2
+        jne     bad
+        ; ... and an ADC or SBB that faults has not touched the carry:
+        ; run again, it gives what it should.
+        mov     ebx, 1
+        stc
+        adc     [LIN + 3010h], ebx              ; 10h + 1 + carry
+        cmp     dword [LIN + 3010h], 12h
+        jne     bad
+        call    protect_d
+        stc
+        sbb     dword [LIN + 3010h], 1          ; 12h - 1 - carry
+        cmp     dword [LIN + 3010h], 10h
+        jne     bad
+        call    protect_d
+        add     dword [LIN + 3010h], 5
+        inc     dword [LIN + 3010h]
+        cmp     dword [LIN + 3010h], 16h
+        jne     bad
+        cmp     dword [faults], 5
+        jne     bad
+
         ; 7. A string move that runs into a page not present.
         mov     dword [fix], map_e
         mov     esi, src
         mov     edi, LIN + 4000h - 8
         mov     ecx, 4
         rep movsd
-        cmp     dword [faults], 3
+        cmp     dword [faults], 6
         jne     bad
         cmp     dword [pf_addr], LIN + 4000h
         jne     bad
@@ -219,6 +251,10 @@ map_c:  or      dword [PT1 + 8], 1
         ret
 unprotect_d:
         or      dword [PT1 + 12], 2
+        invlpg  [LIN + 3000h]
+        ret
+protect_d:
+        and     dword [PT1 + 12], 0FFFFFFFDh
         invlpg  [LIN + 3000h]
         ret
 map_e:  mov     [pf_ecx], ecx

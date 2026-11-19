@@ -63,8 +63,10 @@ def UNPX(n):
 # Special operations.
 NOP, SETSEG, READ, WRFL, FLBIT, RAISE, CHKCS, LEA = range(8)
 # A LOAD's aop: the place will be written by this instruction (with
-# paging the page is looked up as for a write). The assembler sets it
-# on the load of a read-modify-write by itself (mark_rmw).
+# paging the page is looked up as for a write, so that a fault comes
+# before anything is changed, the flags included). The assembler sets
+# it on the load of a read-modify-write by itself (mark_rmw), and for
+# a LOADOP sets cc bit 1, which says the same.
 RMW = 8
 # ... or looked at ahead of a write that cannot be taken back (INS,
 # ENTER): the page is looked up as for the write itself.
@@ -85,6 +87,12 @@ J_REG, J_NOT1, J_ZERO = range(3)
 # cc bits of a memory access with aupd: move A as a string instruction
 # does; a STORE at A that then adds the size to A.
 STR, UP = 1, 8
+# cc of a LOADOP whose operands are memory and the immediate, in that
+# order (CMP m, imm and the like).
+M_IMM = 9
+# A LOAD's aop bit 0: the memory operand is a byte, and the register
+# gets it zero-extended to the size.
+BYTE = 1
 # Operand selectors.
 LIT, RM, REG, OPR = range(4)
 ISIZE = 3                       # the instruction's operand size
@@ -326,10 +334,16 @@ for op, byte, imm in [(0x80, 1, I_8), (0x81, 0, I_Z), (0x82, 1, I_8),
                       (0x83, 0, I_S8)]:                 # r/m, imm
     at([op], modrm=1, imm=imm, byte=byte, mem=False)
     u(unit=ALUI, selaop=2, sela=RM, seld=RM, d=0, size=ISIZE, fm=1, end=1)
-    at([op], modrm=1, imm=imm, byte=byte, mem=True, lock=1)
-    u(unit=LOAD, ea=1, d=T1, size=ISIZE)
-    u(unit=ALUI, selaop=2, a=T1, d=T1, size=ISIZE, fm=1)
-    u(unit=STORE, cc=2, c=T1, size=ISIZE, end=1)
+    at([op], modrm=1, imm=imm, byte=byte, mem=True, group=1, lock=1)
+    for r in range(8):
+        if r == 7:
+            # CMP: memory and the immediate in one step, nothing written.
+            u(unit=LOADOP, aop=CMP, ea=1, cc=M_IMM, size=ISIZE, fm=1, end=1)
+        else:
+            u(unit=LOADOP, aop=r, ea=1, cc=M_IMM, d=T1, size=ISIZE, fm=1,
+              jmp='store_t1')
+label('store_t1')
+u(unit=STORE, cc=2, c=T1, size=ISIZE, end=1)
 
 for op, byte in pair(0x84):                             # TEST r/m, r
     at([op], modrm=1, byte=byte, mem=False)
@@ -607,12 +621,6 @@ u(unit=STORE, a=ESP, aop=ST_READ, b=R_NEXT, c=T2, seg=SS, a16=1, aupd=1,
   size=ISIZE, br=7, cc=J_REG, end=1)
 label('jmp_t2')
 u(unit=SPEC, aop=NOP, c=T2, size=ISIZE, br=7, cc=J_REG, end=1)
-label('inc_m')
-u(unit=ALU, aop=INC, a=T1, d=T1, size=ISIZE, fm=2)
-u(unit=STORE, cc=2, c=T1, size=ISIZE, end=1)
-label('dec_m')
-u(unit=ALU, aop=DEC, a=T1, d=T1, size=ISIZE, fm=2)
-u(unit=STORE, cc=2, c=T1, size=ISIZE, end=1)
 label('push_t1')
 push(T1, end=1)
 label('pop_m')
@@ -631,8 +639,8 @@ for op, byte in both(0xFE):
         u(unit=STORE, a=ESP, selc=RM, seg=SS, a16=1, aupd=1, size=ISIZE, end=1)
         invalid()
     at([op], modrm=1, byte=byte, mem=True, group=1, lock=1)
-    u(unit=LOAD, ea=1, d=T1, size=ISIZE, jmp='inc_m')
-    u(unit=LOAD, ea=1, d=T1, size=ISIZE, jmp='dec_m')
+    u(unit=LOADOP, aop=INC, ea=1, cc=1, d=T1, size=ISIZE, fm=2, jmp='store_t1')
+    u(unit=LOADOP, aop=DEC, ea=1, cc=1, d=T1, size=ISIZE, fm=2, jmp='store_t1')
     if not byte:
         u(unit=LOAD, ea=1, d=T2, size=ISIZE, jmp='call_t2')
         u(unit=SPEC, aop=LEA, ea=1, d=T5, jmp='callf_m')
@@ -663,8 +671,19 @@ for op, size, tail in [(0xB6, 0, 't1_to_reg'), (0xB7, 1, 't1_to_reg'),
     u(unit=ALU, aop=OR, a=ZERO, b=ZERO, d=T1)
     u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=size, jmp=tail)
     at([op], modrm=1, mem=True, map0f=1)
-    u(unit=ALU, aop=OR, a=ZERO, b=ZERO, d=T1)
-    u(unit=LOAD, ea=1, d=T1, size=size, jmp=tail)
+    if op == 0xB6:
+        # A byte, zero-extended as it is loaded.
+        u(unit=LOAD, ea=1, aop=BYTE, seld=REG, d=0, size=ISIZE, end=1)
+    elif op == 0xB7:
+        u(unit=LOAD, ea=1, cc=W16, seld=REG, d=0, size=ISIZE, end=1)
+    elif op == 0xBE:
+        u(unit=LOAD, ea=1, aop=BYTE, d=T1, size=1)
+        u(unit=ALU, aop=SEXT, b=T1, d=T1, size=1)
+        u(unit=ALU, aop=SEXT, b=T1, seld=REG, d=0, size=ISIZE, end=1)
+    else:
+        u(unit=LOAD, ea=1, d=T1, size=1)
+        u(unit=ALU, aop=SEXT, b=T1, d=T1, size=2)
+        u(unit=ALU, aop=OR, a=ZERO, b=T1, seld=REG, d=0, size=ISIZE, end=1)
 
 at([0xD7])                                              # XLAT
 u(unit=ALU, aop=OR, a=ZERO, b=ZERO, d=T1)
@@ -763,8 +782,6 @@ for name, sign in [('mul', UNSIGNED), ('imul', SIGNED)]:
     label(name)                                         # eDX:eAX = eAX * T1
     u(unit=MUL, aop=sign, a=EAX, b=T1, d=EAX, size=ISIZE, fm=1)
     u(unit=SPEC, aop=MULHI, d=EDX, size=ISIZE, end=1)
-label('test_t1')
-u(unit=ALUI, aop=AND, a=T1, size=ISIZE, fm=1, end=1)
 label('not_m')
 u(unit=ALUI, aop=XOR, a=T1, d=T1, size=ISIZE, usek=1, k=-1)
 u(unit=STORE, cc=2, c=T1, size=ISIZE, end=1)
@@ -787,7 +804,19 @@ def t(aop, a, b, d, **kw):
     u(unit=ALU, aop=aop, a=a, b=b, d=d, size=ISIZE, **kw)
 
 
-for name, kind in [('div8', 8), ('div', 0), ('idiv8', 12), ('idiv', 4)]:
+# DIV with 16 or 32 bits, the commonest: straight from and to the
+# registers. T1 is the divisor. (The flags are kept: the comparison
+# changes them and DIV does not.)
+label('div')
+u(unit=SPEC, aop=READ, b=R_FLAGS, d=T7)
+t(SUB, EDX, T1, None, fm=3)
+u(unit=SPEC, aop=NOP, jmp='div_error', ucc=AE)
+u(unit=SPEC, aop=DIVGO, a=EDX, b=EAX, c=T1, size=ISIZE)
+u(unit=SPEC, aop=DIVQ, d=EAX, size=ISIZE)
+u(unit=SPEC, aop=DIVR, d=EDX, size=ISIZE)
+u(unit=SPEC, aop=WRFL, a=T7, usek=1, k=-1, end=1)
+
+for name, kind in [('div8', 8), ('idiv8', 12), ('idiv', 4)]:
     label(name)
     u(unit=ALUI, aop=OR, a=ZERO, d=T3, usek=1, k=kind)
     if kind & 8:
@@ -875,9 +904,12 @@ for op, byte in both(0xF6):
     u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=ISIZE, jmp='div' + sfx)
     u(unit=ALU, aop=OR, a=ZERO, selb=RM, d=T1, size=ISIZE, jmp='idiv' + sfx)
     at([op], modrm=1, imm=imm, byte=byte, mem=True, group=1, lock=1)
-    for tail in ['test_t1', 'test_t1', 'not_m', 'neg_m', 'mul' + sfx,
+    for tail in ['test', 'test', 'not_m', 'neg_m', 'mul' + sfx,
                  'imul' + sfx, 'div' + sfx, 'idiv' + sfx]:
-        u(unit=LOAD, ea=1, d=T1, size=ISIZE, jmp=tail)
+        if tail == 'test':
+            u(unit=LOADOP, aop=AND, ea=1, cc=M_IMM, size=ISIZE, fm=1, end=1)
+        else:
+            u(unit=LOAD, ea=1, d=T1, size=ISIZE, jmp=tail)
 
 at([0xAF], modrm=1, mem=False, map0f=1)                 # IMUL r, r/m
 u(unit=MUL, aop=SIGNED, sela=REG, selb=RM, seld=REG, d=0, size=ISIZE, fm=1,
@@ -1826,7 +1858,7 @@ lower()
 
 
 def mark_rmw():
-    """Give every LOAD that a store to the same place can follow (a
+    """Give every LOAD and LOADOP that a store to the same place can follow (a
     STORE with cc bit 1, which reuses the load's address) the RMW mark:
     follow the words from the load until the instruction ends or
     another memory access comes."""
@@ -1841,7 +1873,7 @@ def mark_rmw():
     marked = 0
     for base, lst in ((0, words_lo), (UPPER, words_hi)):
         for i, x in enumerate(lst):
-            if unit(x) != LOAD:
+            if unit(x) not in (LOAD, LOADOP):
                 continue
             todo, seen, found = [(base + i, True)], set(), False
             while todo and not found:
@@ -1867,7 +1899,7 @@ def mark_rmw():
                         continue
                 todo.append((a + 1, False))
             if found:
-                x['w'] |= RMW << 26
+                x['w'] |= (RMW << 26) if unit(x) == LOAD else (2 << 43)
                 marked += 1
     return marked
 

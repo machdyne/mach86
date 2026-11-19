@@ -118,13 +118,19 @@ Shareware games go on D:. Two have been run on a Sergei ML2:
 - **The Secret of Monkey Island demo** needs `SLOW 5` before it is
   started with AdLib sound (`midemo a`): its sound driver divides by
   zero on a machine this fast, as it does on a real 486.
-- **DOOM** (shareware 1.9): `doom -nosound` is what has run on a
-  board. It pauses for a minute or so at `R_Init`. Since round 30
-  there is a Sound Blaster, **untested on a board**: for sound,
-  DOOM wants a `DEFAULT.CFG` beside it that names the card (its
-  `SETUP.EXE` writes one; the lines that matter are below), and is
-  then started as plain `doom`. On the model it plays effects
-  through the Sound Blaster and music through the AdLib.
+- **DOOM** (shareware 1.9) runs on a Sergei ML2, with sound since
+  round 30 (a user's report: effects through the Sound Blaster,
+  with "3" for the number of effects to mix). For sound, DOOM wants
+  a `DEFAULT.CFG` beside it that names the card (its `SETUP.EXE`
+  writes one; the lines that matter are below), and is then started
+  as plain `doom`; `doom -nosound` does without. It pauses for a
+  while at `R_Init`.
+
+  **To measure speed on a board:** `doom -timedemo demo1` plays the
+  first demo as fast as the machine can and prints "timed *n*
+  gametics in *m* realtics" when it ends; frames a second are
+  35 × *n* / *m*. Nobody has reported a figure yet; one before and
+  one after a change is the measure of that change.
 
   ```
   snd_musicdevice		2

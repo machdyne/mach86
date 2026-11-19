@@ -99,6 +99,15 @@ of the two cycles can probably be had back (the buffer's answer is
 ready early enough to let the access start in the cycle it is
 looked up); that has not been tried.
 
+**A correction in round 32.** "Asks for the write when it reads" was
+true of instructions whose microcode begins with a plain load, and
+not of those that begin with a load-and-operate: `ADD`, `OR`, `ADC`,
+`SBB`, `AND`, `SUB` and `XOR` with a register or an immediate into
+memory. A write of theirs to a read-only page faulted with the
+flags already changed. No test had such a case; the paging test has
+them now, and the microassembler marks both kinds
+([cpu_b.md](cpu_b.md#a-read-modify-write-that-faults)).
+
 **The decoded-instruction cache under paging.** Its entries are
 found by linear address, so when the mapping changes (CR3, CR0,
 `INVLPG`) the whole cache is emptied, which takes 2,048 cycles and
@@ -200,8 +209,11 @@ push anything, and `pmseg` only loads it.
   changed through the frame's own address and run again; a page
   not present, mapped by the fault's handler and the instruction
   run again; the accessed and dirty bits; a read-only page written
-  by level 0, and refused once CR0.WP is set; `INVLPG`; `REP MOVSD`
-  running into a page not present, and finishing after the handler.
+  by level 0, and refused once CR0.WP is set; `INVLPG`; `CMP` and
+  `TEST` with a read-only page, which may not fault; `ADC`, `SBB`
+  and `ADD` into one, which fault with the flags untouched and give
+  the right sum when run again; `REP MOVSD` running into a page not
+  present, and finishing after the handler.
 - All four run three ways: on the model; **in lockstep**, the RTL core
   against the model after every instruction, with segment bases and
   limits, the D and B bits, the privilege level, CR0 and both table
