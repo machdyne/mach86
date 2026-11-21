@@ -104,19 +104,21 @@ yet; when it is, this table is replaced by its measurements.
 
 | | Lakritz build | Has |
 |---|---:|---:|
-| Logic cells | **23,591** (round 32; 19,900 before paging and virtual 8086 mode) | 24,288 (**97%**) |
+| Logic cells | **22,904** (round 40, without paging, virtual 8086 mode and the I/O permission bitmap; 23,603 with them in round 39, and no room for anything) | 24,288 (**94%**: 1,384 left) |
 | Block RAM | **56: all of them** (round 26) | 56 |
-| CPU clock | routed at 35.4 MHz (round 32, one seed, with the placer's timing weight raised as on the Sergei) | runs at 33.16 |
+| CPU clock | routed at 35.1 MHz (round 40, the best of three seeds: 34.6, 33.8, 35.1; 34.7 at best in round 39, 36.8 on one seed in round 38) | runs at 33.16 |
 
 Round 29 took 2,500 logic cells for paging, virtual 8086 mode and
-the I/O permission bitmap, and Lakritz is full: about 700 cells are
-left. Round 32's faster decoder (the window,
-[cpu_b.md](cpu_b.md#the-decoders-window)) did not fit by 34 cells and
-is left out of this build (`CPU_WIN(0)` in `rtl/boards/lakritz.v`);
-the round's other gains are in. Task switches, if they come, have
-to take their cells from something. Lakritz stays on design B: the
-faster core that is planned ([cpu_c.md](cpu_c.md)) is for the 45F
-boards.
+the I/O permission bitmap, and Lakritz was full. Since round 40
+those three are a build option of the processor
+([cpu_b.md](cpu_b.md#round-40)) and Lakritz builds without them:
+DOS, DOS/4GW and DOOM do not use them; a memory manager like
+Jemm386 cannot run. What that freed went to the decoder's faster
+window (round 32, left out here until now), to one-cycle shifts,
+and to 1,400 cells of room, which the router uses too.
+`make lakritz LAK_DEFS="-DM86_VMEM=1 -DM86_WIN=0"` builds a Lakritz
+with all of protected mode; it is then full again (24,048 cells
+with round 40's shifter, and it misses its clock).
 
 What is different from Sergei, underneath; a program sees the same
 machine:
@@ -171,7 +173,16 @@ design B at 31.5 MHz (33.16 in round 23's build), 64 MB of the DDR3 behind a 32 
 with 64 KB of video memory in block RAM on DDMI, a USB keyboard, a
 serial console, the SD card, a USB mouse, and the PC speaker and an
 AdLib on the optical output; video memory past 64 KB in the DDR3.
-27,557 logic cells of 43,848 (62%) and 97 of 108 block RAMs in round 32, routed at 34.6 MHz. It runs on the board ([README](../README.md#status)).
+28,633 logic cells of 43,848 (65%) and 97 of 108 block RAMs in round 40, routed at 34.0 MHz for the CPU and 50.1 MHz for the memory controller's 48 (one seed; round 38's design made 33.9 on one). The margin of both clocks on this board is thin and has been, and other seeds miss one or the other: look at both in `output/sergei_ml2/pnr.log` after a build. Since round 40 the main memory's bridge carries a cache line at a time ([soc.md](soc.md#the-main-memory)); that has not run on a board, and `make sergei_ml2 BOARD_DEFS=-DM86_XLINE=0` builds the bridge of before. Builds up to round 32's have run on the board ([README](../README.md#status)).
+
+**With design C** (round 37, `make sergei_ml2_c`, [cpu_c.md](cpu_c.md)):
+the same machine with the second core, at 39.4 MHz (the PLL's 630 MHz
+divided by 16; routed at 41 to 44.6). 31,300 logic cells (71%), 98 block
+RAMs. It boots DOS in simulation of the whole SoC. **It has not run
+on a board, and it is slower than the design B build**, not faster:
+see cpu_c.md. With the floating-point unit as well
+(`make sergei_ml2_cf`) the design does not fit the 45F
+([fpu.md](fpu.md#size)).
 
 **The first test build** used none of the board's DDR3: 160 KB of
 RAM in block RAM, 8,000 logic cells and all 108 block RAMs, routed

@@ -70,6 +70,13 @@ on memory accesses, which goes into the limit check's register.
 
 ## Paging
 
+**A build option since round 40.** Paging, virtual 8086 mode and the
+I/O permission bitmap are the core's `VMEM` parameter
+([cpu_b.md](cpu_b.md#round-40)): the Sergei builds have them, Lakritz
+does not. Without them CR0's PG bit and EFLAGS' VM bit can be set
+and do nothing, and a port above the I/O privilege level is a
+general protection fault whatever the task's bitmap says.
+
 Round 29. With CR0.PG set every address goes through the page
 tables: 4 KB pages, a directory and tables as CR3 names them.
 

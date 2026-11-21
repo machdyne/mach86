@@ -64,7 +64,8 @@ The whole of it takes well under a second.
 | 09h | Keyboard: scancodes to characters, Shift, Ctrl, Alt, Caps Lock, Ctrl-Alt-Del | US layout only. A key that follows the E0h prefix acts as the old key with the same code, except that Shift does not make digits of the grey arrows. No Num Lock, no Ctrl-Break, no Alt or Ctrl codes for the function keys |
 | 15h | 88h: memory above 1 MB, in KB. 87h: move a block anywhere in memory (through unreal mode; [pmode.md](pmode.md)). 90h, 91h: nothing | Round 24. E801h and E820h are not there; programs fall back to 88h |
 | 10h | Video: set mode, cursor, scroll, characters, teletype, write string; pixels; palette and DAC; font and display information | Modes 03h, 04h–06h, 0Dh, 0Eh, 13h; a mode that is not there gives text. One page. The bell (07h) sounds the speaker ([sound.md](sound.md)). The list is in [video.md](video.md#the-bios) |
-| 11h, 12h | Equipment word, memory size | Done |
+| 11h, 12h | Equipment word (with the FPU's bit when there is one: [fpu.md](fpu.md)), memory size | Done |
+| 75h | The FPU's error (interrupt 13): port F0h, end of interrupt, then INT 02h | Done; no hardware raises it yet |
 | 13h | Disk: reset, status, read, write, verify, parameters, drive type; and by sector number (41h check, 42h read, 43h write, 44h verify, 48h size) for the hard disk | One drive. No format |
 | 14h, 17h | Serial, printer | Report a timeout: no ports yet |
 | 15h | System: extended memory size, device hooks | Reports no extended memory until the CPU has protected mode. Everything else is "not supported" |

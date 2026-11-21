@@ -112,6 +112,15 @@ module m86b_core #(
     // an instruction's first execution about twice as fast and costs
     // about 600 LUTs, which Lakritz does not have.
     parameter WIN   = 1,
+    // Paging, virtual 8086 mode and the I/O permission bitmap: 1 with
+    // them, 0 without (CR0's PG bit and EFLAGS' VM bit then do nothing,
+    // and a port above the I/O privilege level is a fault). They are
+    // about 2,500 LUTs, and DOS, DOS/4GW and DOOM use none of them; a
+    // memory manager like Jemm386 needs them all.
+    parameter VMEM  = 1,
+    // A load that is a whole instruction lets the next one start in
+    // its second cycle (see "the load's second cycle"): 1 with, 0 without.
+    parameter OVL   = 1,
     parameter UCODE = "ucode.hex",
     parameter ATTR  = "attr.hex"
 ) (
@@ -166,6 +175,7 @@ module m86b_core #(
 
     output reg         halted,
     output reg         step_done,   // an instruction, fault or interrupt finished
+    output reg         step_two,    // ... and with it a second instruction (see "the load's second cycle")
     output reg  [7:0]  last_exc,
     output reg  [31:0] dbg_insns
 );
@@ -298,7 +308,9 @@ module m86b_core #(
     // a virtual 8086 task's registers (IRET from level 0) and wants
     // loads of that kind already. vm_int: it is on the way out of one,
     // into a handler: VM is clear, but the flags it pushes say VM.
-    reg               vm_ld, vm_int;
+    reg               vm_ld_r, vm_int_r;
+    wire              vm_ld  = (VMEM != 0) && vm_ld_r;
+    wire              vm_int = (VMEM != 0) && vm_int_r;
     // What a descriptor said of each segment: loaded with a null
     // selector, not writable, not readable, its level, and whether an
     // outer level loses it (data, or code that is not conforming).
@@ -329,7 +341,7 @@ module m86b_core #(
     // the accessed and dirty bits, and raises the page fault. The uop
     // or the fetch then goes ahead with the physical address. The
     // cost is two cycles an access, and nothing when paging is off.
-    wire       pg = cr0[31] && cr0[0];
+    wire       pg = (VMEM != 0) && cr0[31] && cr0[0];
     localparam [3:0] X_IDLE = 4'd0, X_LOOK = 4'd1, X_RDY = 4'd2, X_W1 = 4'd3, X_W2 = 4'd4,
                      X_W3 = 4'd5, X_W4 = 4'd6, X_W5 = 4'd7, X_W6 = 4'd8, X_W7 = 4'd9,
                      X_W8 = 4'd10, X_BI = 4'd11, X_BW = 4'd12, X_IOA = 4'd13, X_IOB = 4'd14,
@@ -397,6 +409,7 @@ module m86b_core #(
     reg  [DCW-1:0] dc_q;
     reg  [DC_AW-1:0] dc_ra, dc_wa;
     reg            dc_re, dc_we;
+    reg  [31:0]    f_imm;           // the immediate of the entry being made
     reg  [DCW-1:0] dc_wd;
     initial for (k = 0; k < (1 << DC_AW); k = k + 1) dc[k] = {DCW{1'b0}};
     always @(posedge clk) begin
@@ -499,18 +512,21 @@ module m86b_core #(
     reg [31:0] lk_lin /* verilator public_flat_rw */;
     reg        lk_pend /* verilator public_flat_rw */;
     reg [18:0] fl /* verilator public_flat_rw */;   // EFLAGS bits 18..0 (18: AC, a 486's)
-    wire       v86 = cr0[0] && fl[17];
-    wire       pmode = cr0[0] && !fl[17] && !vm_ld;     // segment loads go through descriptors
-    reg        in_rom;          // executing from the microcode ROM
+    wire       fl_vm = (VMEM != 0) && fl[17];   // EFLAGS.VM
+    wire       v86 = cr0[0] && fl_vm;
+    wire       pmode = cr0[0] && !fl_vm && !vm_ld;     // segment loads go through descriptors
+    reg        in_rom /* verilator public_flat */;  // executing from the microcode ROM
     reg        s1_v, s2_v;      // ROM word fetched; ROM uop ready
     reg [UC_AW-1:0] upc1;       // address of the word in ur_q
-    reg        cyc2, cyc3;
+    reg        cyc2 /* verilator public_flat */;
+    reg        cyc3 /* verilator public_flat */;
     reg        uz;              // the last ALU result was zero
     reg        jt_pend;
     reg [31:0] jt_eip;
 
     // The instruction being executed.
-    reg [31:0] i_eip, i_lin, i_imm, i_disp;
+    reg [31:0] i_eip /* verilator public_flat */;
+    reg [31:0] i_lin, i_imm, i_disp;
     reg [3:0]  i_len;
     reg [CW-1:0] i_ctx;
     reg        i_first;         // its first uop is still to be cached
@@ -681,6 +697,28 @@ module m86b_core #(
     // a mode switch, as a rule -- the cache is neither used nor filled.
     wire       mode_ok = (cs_d == ss_b);
 
+    // ---- the load's second cycle ----
+    // A load that is a whole instruction (MOV reg, mem and its kin, POP)
+    // is over, as far as the order of instructions goes, in its first
+    // cycle: the address is on its way to the bus and the next
+    // instruction's entry is being read. What is left -- the data,
+    // and its way into the register -- is kept here (lp_*) and done
+    // in the next cycle, beside the next instruction's first uop.
+    // That uop waits a cycle if the data is not there yet, if it reads
+    // the register being loaded, or if it writes a register itself in
+    // this cycle (there is one write port); and it must end in this
+    // cycle or change nothing in it, so that nothing is ever half
+    // done when the load ends. Not with paging on.
+    reg        lp_v /* verilator public_flat */;    // a load's data is still to come
+    reg        lp_we, lp_ldb, lp_ah, lp_16;
+    reg [3:0]  lp_d, lp_lane;
+    reg [1:0]  lp_size;
+    wire       lp_fire = lp_v && d_ack && !flt_now;     // it is here: written this cycle
+    wire       lp_wait = lp_v && !d_ack && !flt_now;
+    wire       lp_dep;              // the uop now in front may not run beside it
+    wire       lp_blk  = lp_v && (!d_ack || lp_dep);
+    wire       ovl;                 // this uop is such a load, in its only cycle
+
     // Once a cached uop has begun (a load waiting for its data, say), it
     // finishes even if the cache is emptied under it by an earlier store.
     wire       hit   = lk_pend && ((!in_rom && (cyc2 || cyc3)) ||
@@ -693,7 +731,7 @@ module m86b_core #(
     reg        rst_seq /* verilator public_flat_rw */;   // the reset microcode is running
     // Between instructions: nothing has begun.
     wire       between  = !rst && lk_pend && !in_rom && !jt_pend && !flt_now &&
-                          !cyc2 && !cyc3 && (xs == X_IDLE);
+                          !cyc2 && !cyc3 && (xs == X_IDLE) && !lp_v;
 
     // A store into a block that holds cached instructions. The entries
     // of the instructions it overlaps are found and removed, between
@@ -737,15 +775,20 @@ module m86b_core #(
     reg [31:0] p_evaddr;
 
     wire       irq_take = between && !phold && irq && fl[9] && !inh;
-    wire       miss /* verilator public_flat */ = lk_pend && !hit && !in_rom && !halted && !jt_pend && !irq_take && !phold;
+    wire       miss /* verilator public_flat */ = lk_pend && !hit && !in_rom && !halted && !jt_pend && !irq_take && !phold && !lp_wait;
     wire       hot   = !in_rom;
     wire [UW-1:0] uop = hot ? q_uop : r_uop;
     wire [PW-1:0] pre = hot ? q_pre : r_pre;
     wire       p_sub = pre[0], p_one = pre[1], p_arith = pre[2];
     wire       p_usec = (u_aop == 4'd2 || u_aop == 4'd3);   // (the carry in: not a hurry)
     wire       p_loadop = pre[4], p_alui = pre[5];
+    // (A pending load holds back only a uop from the cache: there is
+    // none while microcode runs. Written so that the microcode's own
+    // paths do not wait for lp_blk; valid00x is valid00 without it.)
+    wire       valid00x = !rst && !halted && !jt_pend && !flt_now && !irq_take && !phold &&
+                          (hot ? hit : s2_v);
     wire       valid00 = !rst && !halted && !jt_pend && !flt_now && !irq_take && !phold &&
-                        (hot ? hit : s2_v);
+                         (hot ? (hit && !lp_blk) : s2_v);
     wire       xl_block;            // an access that the paging unit is not ready for
     wire       valid0 = valid00 && !xl_block;
     wire       st_block;            // a store that the memory is not ready for
@@ -761,8 +804,12 @@ module m86b_core #(
     wire        is_setseg = (u_unit == U_SPEC) && (u_aop == SP_SETSEG);
     // (A SETSEG with cc 2 empties a segment an outer level may not
     // keep, on the spot.)
-    wire        pm_div = valid && is_setseg && pmode && !in_pm && !u_cc[1];
-    wire        pm_fin = valid && is_setseg && in_pm;
+    // (A load of a segment register never runs beside a pending load.)
+    wire        pm_div = valid00x && !xl_block && !lp_v && is_setseg && pmode && !in_pm && !u_cc[1];
+    // (valid_x: valid without the wait for a pending load, for what
+    // only microcode does.)
+    wire        valid_x = valid00x && !xl_block && !(u_unit == U_STORE && !d_st_rdy);
+    wire        pm_fin = valid_x && is_setseg && in_pm;
     wire        last = !is_setseg ? last0 : in_pm ? pm_last : (last0 && (!pmode || u_cc[1]));
     // Going there and coming back are jumps in the microcode.
     wire        pm_jump = (pm_div || (pm_fin && !pm_last)) && !hot;
@@ -815,7 +862,7 @@ module m86b_core #(
     // across two pages.)
     wire        xl_need = is_mem && !cyc2 &&
                           ((u_seg != 3'd7) ? (pg && (!relatch || x_cross || !x_wok))
-                                           : (cr0[0] && (fl[17] || cpl > fl[13:12])));
+                                           : ((VMEM != 0) && cr0[0] && (fl_vm || cpl > fl[13:12])));
     assign      xl_block = xl_need && !(xs == X_RDY && !x_dec);
     wire        xl_start = valid00 && xl_need && (xs == X_IDLE);
     wire        relatch = (u_unit == U_STORE) && u_cc[1] && (u_br != 3'd1);
@@ -846,7 +893,12 @@ module m86b_core #(
     wire [31:0] lin    = {u_a16 ? (cy16 ? seg_hi1[u_seg] : ad_b[31:16]) : lin_hi,
                           lin_lo[15:0]};
 
-    assign e_req  = valid && !stall && is_mem && !cyc2 && (u_unit != U_STORE) &&
+    // (A uop held back behind a pending load only because it needs
+    // the load, or the write port, announces its read all the same:
+    // the bus is then without a read in the next cycle, the memory
+    // drops what was announced, and the uop announces it again. That
+    // keeps the look at the uop's registers out of this path.)
+    assign e_req  = valid_x && !lp_wait && !stall && is_mem && !cyc2 && (u_unit != U_STORE) &&
                     (u_seg != 3'd7) && !pg;
     assign e_addr = lin;
     assign e_size = m_size;
@@ -860,9 +912,12 @@ module m86b_core #(
     reg [31:0] chk_off;
     reg [32:0] chk_lim;
     reg        chk_ss, chk_bad;
-    wire       acc_bad = cr0[0] && (u_seg != 3'd7) && (u_seg != 3'd6) &&
-                         (sg_null[u_seg] ||
-                          ((u_unit == U_STORE) ? sg_nw[u_seg] : sg_nr[u_seg]));
+    wire       acc_bad = (cr0[0] && (u_seg != 3'd7) && (u_seg != 3'd6) &&
+                          (sg_null[u_seg] ||
+                           ((u_unit == U_STORE) ? sg_nw[u_seg] : sg_nr[u_seg]))) ||
+                         // (Without the I/O permission bitmap: no port
+                         // above the I/O privilege level.)
+                         ((VMEM == 0) && cr0[0] && (u_seg == 3'd7) && (cpl > fl[13:12]));
     wire       lim_now = chk_v && (chk_lim[32] || chk_off > chk_lim[31:0]);
 
     // A jump target outside the code segment, likewise a cycle late.
@@ -916,10 +971,25 @@ module m86b_core #(
     // ---- shifter and multiplier ------------------------------------------------
 
     // The count is the immediate, or register B when cc[0] is set.
-    wire [4:0]  sh_n   = (u_unit != U_SHIFT) ? 5'd0 : u_cc[0] ? vb[4:0] : imm[4:0];
+    // (A count from a register arrives late, behind the register file,
+    // and the shifter is a long way: such a shift takes two cycles,
+    // with the count registered in the first. A count in the
+    // instruction is there at once.)
+    reg  [4:0]  sh_nr;
+    always @(posedge clk)
+        sh_nr <= vb[4:0];
+    wire [4:0]  sh_n   = (u_unit != U_SHIFT) ? 5'd0 : u_cc[0] ? sh_nr : imm[4:0];
     wire        sh_rt  = u_aop[0];
-    wire [4:0]  sh_k   = sh_rt ? (5'd0 - sh_n) : sh_n;
-    wire [32:0] pow2   = 33'd1 << sh_k;
+    wire        sh_nz  = (sh_n != 5'd0);
+    // How far to the left: the count, or 32 less the count for a shift
+    // to the right. For an instruction from the cache with its count
+    // in it, that was worked out when the entry was made and is in
+    // bits 12-8 of the entry's immediate (see dc_wd): the subtraction
+    // would otherwise stand between the cache and the shifter. For
+    // the rest it is made here, from registers.
+    wire [4:0]  sh_nreg = u_cc[0] ? sh_nr : (!hot && r_usek) ? r_k[4:0] : i_imm[4:0];
+    wire [4:0]  sh_kreg = sh_rt ? (5'd0 - sh_nreg) : sh_nreg;
+    wire [4:0]  sh_k   = (hot && !u_cc[0]) ? q_imm[12:8] : sh_kreg;
     wire        sh_sx  = (u_aop == 4'd7);
     // (The double shifts: see below.)
     wire        sh_dbl  = (u_unit == U_SHIFT) && (u_aop[2:1] == 2'd1);
@@ -928,14 +998,10 @@ module m86b_core #(
                          (u_size == 2'd1) ? {2{va[15:0]}} : va;
     wire        a_sign = (u_size == 2'd0) ? va[7] : (u_size == 2'd1) ? va[15] : va[31];
     wire        b_sign = (u_size == 2'd0) ? vb[7] : (u_size == 2'd1) ? vb[15] : vb[31];
-    wire [32:0] m_a = (u_unit == U_MUL)
-                        ? {u_aop[0] & a_sign, u_aop[0] ? (va | ({32{a_sign}} & ~smask)) : va}
-                        : (u_aop[2:1] == 2'd0) ? {1'b0, va_rep}
-                        : sh_d16x ? {1'b0, vc[15:0], vc[15:0]}
-                        : {sh_sx & a_sign, sh_sx ? (va | ({32{a_sign}} & ~smask)) : va};
-    wire [32:0] m_b = (u_unit == U_MUL)
-                        ? {u_aop[0] & b_sign, u_aop[0] ? (vb | ({32{b_sign}} & ~smask)) : vb}
-                        : pow2;
+
+    // ---- the multiplier: three cycles, registered before and after ----
+    wire [32:0] m_a = {u_aop[0] & a_sign, u_aop[0] ? (va | ({32{a_sign}} & ~smask)) : va};
+    wire [32:0] m_b = {u_aop[0] & b_sign, u_aop[0] ? (vb | ({32{b_sign}} & ~smask)) : vb};
     reg  signed [32:0] m_a_r, m_b_r;
     reg  signed [65:0] prod;
     always @(posedge clk) begin
@@ -943,23 +1009,56 @@ module m86b_core #(
         m_b_r <= m_b;
         prod  <= m_a_r * m_b_r;
     end
+
+    // ---- the shifter: one cycle ----
+    // Every shift and rotate is a shift to the left, by the count or,
+    // for one to the right, by 32 less the count, of a 33-bit signed
+    // value into 64 bits: the low half is what went left, the high
+    // half what a shift to the right leaves (round 39 and before did
+    // this as a multiplication by a power of two, in three cycles).
+    // The 64 bits come from one rotation by k: its bits below k are
+    // the high half's low bits, the rest the low half's; above them
+    // the high half is the sign.
+    function [31:0] rotl32(input [31:0] x, input [4:0] k);
+        reg [31:0] r;
+        begin
+            r = k[0] ? {x[30:0], x[31]} : x;
+            r = k[1] ? {r[29:0], r[31:30]} : r;
+            r = k[2] ? {r[27:0], r[31:28]} : r;
+            r = k[3] ? {r[23:0], r[31:24]} : r;
+            rotl32 = k[4] ? {r[15:0], r[31:16]} : r;
+        end
+    endfunction
+    wire [32:0] sh_a = (u_aop[2:1] == 2'd0) ? {1'b0, va_rep}
+                       : sh_d16x ? {1'b0, vc[15:0], vc[15:0]}
+                       : {sh_sx & a_sign, va};
+    wire [31:0] sh_m   = ~(32'hFFFFFFFF << sh_k);       // the bits below k
+    // (Where the sign goes in for an arithmetic shift to the right of
+    // 8 or 16 bits: from the operand's top down, which is the same
+    // mask moved down. The operand itself is not sign-extended first:
+    // that would put the choice of its sign bit in front of the
+    // rotation.)
+    wire [31:0] sh_ms  = (u_size == 2'd0) ? {24'd0, sh_m[31:24]} :
+                         (u_size == 2'd1) ? {16'd0, sh_m[31:16]} : sh_m;
+    wire        sh_over = sh_sx && ((u_size == 2'd0) ? (sh_n > 5'd8) :
+                                    (u_size == 2'd1) ? (sh_n > 5'd16) : 1'b0);
+    wire [31:0] sh_r   = rotl32(sh_a[31:0], sh_k);
+    wire [31:0] sh_lo  = sh_r & ~sh_m;
+    wire [31:0] sh_hi  = (sh_r & sh_m) | ({32{sh_a[32]}} & ~sh_ms);
     // Kinds 2 and 3 are the double shifts, SHLD and SHRD: register A
     // shifted, and the bits register C gives OR-ed in where A's left.
     // Those are "the other half" of the same shift of C, which a
-    // second multiplier makes beside the first, so that a double
+    // second rotation makes beside the first, so that a double
     // shift is one uop like any other. (DOOM draws its floors with
     // them.) With 16-bit operands and more than 16 places the
-    // hardware's result is C rotated; the first multiplier does that
+    // hardware's result is C rotated; the first rotation does that
     // and the second's bits are left out.
-    reg  [31:0] m_c_r;
-    reg  [63:0] prod2;
-    always @(posedge clk) begin
-        m_c_r <= vc;
-        prod2 <= m_c_r * m_b_r[31:0];
-    end
+    wire [31:0] sh_r2  = rotl32(vc, sh_k);
+    wire [31:0] sh_lo2 = sh_r2 & ~sh_m;
+    wire [31:0] sh_hi2 = sh_r2 & sh_m;
     wire [31:0] sh_oth = sh_d16x ? 32'd0 :
-                         (u_size == 2'd1) ? {16'd0, prod2[31:16]} :
-                         sh_rt ? prod2[31:0] : prod2[63:32];
+                         (u_size == 2'd1) ? {16'd0, sh_lo2[31:16]} :
+                         sh_rt ? sh_lo2 : sh_hi2;
     // Multiply: the upper half of the product, and whether it holds
     // more than the sign (or zero) extension of the lower half.
     wire [31:0] mul_hi = (u_size == 2'd0) ? {24'd0, prod[15:8]} :
@@ -969,11 +1068,21 @@ module m86b_core #(
     wire        mul_ov = mul_hi != ((u_aop[0] && mul_ls) ? smask : 32'd0);
 
     wire        sh_rot = (u_aop[2:1] == 2'd0);
-    wire [31:0] sh_raw = (sh_rot || sh_d16x) ? (prod[31:0] | prod[63:32]) :
-                         (sh_rt ? prod[63:32] : prod[31:0]) | (sh_dbl ? sh_oth : 32'd0);
-    // A count of zero changes nothing.
-    wire        sh_nz  = (sh_n != 5'd0);
-    wire [31:0] sh_res = sh_nz ? (sh_raw & smask) : va;
+    // (A count of zero changes nothing: then the low half is the
+    // operand, and nothing is OR-ed in.)
+    wire [31:0] sh_raw = (sh_rot || sh_d16x) ? sh_r :
+                         ((sh_rt && sh_nz) ? sh_hi : sh_lo) | ((sh_dbl && sh_nz) ? sh_oth : 32'd0);
+    wire [31:0] sh_res = sh_raw & smask;
+    // The zero flag: whether the result is zero, found for each of
+    // the things the result is put together from, side by side, and
+    // not from the result (an OR is zero when both its sides are):
+    // from the result it was the longest way through the core.
+    wire        sh_z_r   = ((sh_r   & smask) == 32'd0);
+    wire        sh_z_lo  = ((sh_lo  & smask) == 32'd0);
+    wire        sh_z_hi  = ((sh_hi  & smask) == 32'd0);
+    wire        sh_z_oth = ((sh_oth & smask) == 32'd0);
+    wire        sh_zf    = sh_d16x ? sh_z_r :
+                           ((sh_rt ? sh_z_hi : sh_z_lo) && (!sh_dbl || sh_z_oth));
     wire        sh_msb = (u_size == 2'd0) ? sh_res[7] :
                          (u_size == 2'd1) ? sh_res[15] : sh_res[31];
     wire        sh_nxt = (u_size == 2'd0) ? sh_res[6] :
@@ -982,10 +1091,10 @@ module m86b_core #(
     // (observed on hardware).
     wire        sh_b8  = (u_size == 2'd0) && (sh_n == 5'd16 || sh_n == 5'd24);
     wire        sh_cf  = (sh_rot || sh_d16x) ? (sh_rt ? sh_msb : sh_res[0]) :
-                         sh_rt  ? (sh_b8 && !sh_sx ? va[7] : prod[31]) :
+                         sh_rt  ? (sh_b8 && !sh_sx ? va[7] : sh_over ? a_sign : sh_lo[31]) :
                          sh_b8  ? va[0] :
-                         (u_size == 2'd0) ? prod[8] :
-                         (u_size == 2'd1) ? prod[16] : prod[32];
+                         (u_size == 2'd0) ? sh_lo[8] :
+                         (u_size == 2'd1) ? sh_lo[16] : sh_hi[0];
     wire        sh_of  = sh_dbl ? sh_msb ^ a_sign :      // the sign changed
                          sh_rot ? (sh_rt ? sh_msb ^ sh_nxt : sh_msb ^ sh_cf) :
                          sh_sx  ? 1'b0 :
@@ -1178,11 +1287,36 @@ module m86b_core #(
 
     // ---- result ------------------------------------------------------------------------
 
-    wire slow_unit = (u_unit == U_SHIFT || u_unit == U_MUL);
+    wire slow_unit = (u_unit == U_MUL) || (u_unit == U_SHIFT && u_cc[0]);
     wire two_cycle = (u_unit == U_LOAD || u_unit == U_LOADOP || slow_unit);
-    wire first     = two_cycle && !(slow_unit ? cyc3 : cyc2);
+    // (A load, a load-and-operate and a shift by a register's count
+    // take two cycles, a multiply three.)
+    wire first     = two_cycle && !ovl && !((u_unit == U_MUL) ? cyc3 : cyc2);
+    assign ovl     = (OVL != 0) && hot && (u_unit == U_LOAD) && last0 && (u_br == 3'd0) &&
+                     (u_seg != 3'd7) && !pg && (u_fm == 2'd0);
+    // What the uop in front would write to a register in this cycle.
+    // (It is in its first cycle whenever a load is pending, and a
+    // uop of two cycles writes nothing in its first but a pointer.)
+    wire u_wr_now  = (is_mem && u_aupd) ? (u_a != ZERO)
+                     : (u_dwe && !two_cycle && u_unit != U_STORE && u_d != ZERO);
+    // (An instruction of several uops may begin beside the load if its
+    // first uop takes two cycles: nothing is changed in the first.)
+    assign lp_dep  = (!last0 && !two_cycle) || u_wr_now || is_setseg ||
+                     (lp_we && (u_a == lp_d || u_b == lp_d || u_c == lp_d));
+    // The data, as the load wanted it.
+    wire [31:0] lp_mask = lp_ldb ? 32'h000000FF :
+                          (lp_size == 2'd0) ? 32'h000000FF :
+                          (lp_size == 2'd1 || lp_16) ? 32'h0000FFFF : 32'hFFFFFFFF;
+    wire [31:0] lp_vm = d_rdata & lp_mask;
+    wire [31:0] lp_wd = lp_ah ? {16'd0, lp_vm[7:0], 8'd0} : lp_vm;
     wire stall     = cyc2 && is_mem && !d_ack;
     // (A divide is busy from its first cycle to the one before its last.)
+    // (For the microcode's address when no uop from the cache is at
+    // work: busy, without the wait for a pending load.)
+    wire busy_x    = (valid00x && !xl_block && !(u_unit == U_STORE && !d_st_rdy) &&
+                      (first || stall || (is_div && !dv_last))) ||
+                     (valid00x && !xl_block && (u_unit == U_STORE) && !d_st_rdy) ||
+                     (valid00x && xl_block);
     wire busy      = (valid && (first || stall || (is_div && !dv_last))) || st_block ||
                      (valid00 && xl_block);
 
@@ -1262,7 +1396,7 @@ module m86b_core #(
     // A second set (ROM bits 88 and 89 both): in virtual 8086 mode;
     // there, and outside the I/O privilege level; coming out of it;
     // at level 0; in protected mode proper.
-    wire [7:0] pcx = {3'd0, cr0[0] && !fl[17], cpl == 2'd0, vm_int,
+    wire [7:0] pcx = {3'd0, cr0[0] && !fl_vm, cpl == 2'd0, vm_int,
                       v86 && (fl[13:12] != 2'b11), v86};
     wire       ck_x = ck_now && s2_v && in_rom;
     wire [7:0] pcond = {ck_x ? ck_in : chk_inner,
@@ -1275,7 +1409,7 @@ module m86b_core #(
                         cr0[0]};
     wire done = (fin && u_br != 3'd3) || jt_pend;
     wire hot_fin = hot && valid && !busy && !last;
-    wire ujump = valid && !busy && !hot && r_ujmp &&
+    wire ujump = valid_x && !busy_x && !hot && r_ujmp &&
                  (!r_ucond || (r_ucpe ? r_pj :
                                r_ucflt ? (in_flt ^ r_ucc[0]) :
                                r_uca ? !a_is1 :
@@ -1336,8 +1470,8 @@ module m86b_core #(
                           (d_op == 8'hFE && mq[5:3] > 3'd1))) ||
                         // (0F 00, SLDT and its kin, LAR and LSL: protected mode only.)
                         (d_map && (d_op == 8'h00 || d_op == 8'h02 || d_op == 8'h03) &&
-                         (!cr0[0] || fl[17])) ||
-                        (!d_map && d_op == 8'h63 && (!cr0[0] || fl[17]));     // (and ARPL)
+                         (!cr0[0] || fl_vm)) ||
+                        (!d_map && d_op == 8'h63 && (!cr0[0] || fl_vm));     // (and ARPL)
     // What only level 0 may do. These are never cached: the level is
     // looked at as they are decoded.
     wire       d_priv = d_map ? (d_op == 8'h06 || d_op == 8'h08 || d_op == 8'h09 ||
@@ -1370,18 +1504,21 @@ module m86b_core #(
     wire        wr_ah   = (u_size == 2'd0) && u_hi[2] && !wr_aupd;
     wire        wr_alu  = (u_unit == U_ALU || u_unit == U_ALUI || u_unit == U_LOADOP ||
                            u_unit == U_STORE);
-    wire        wr_sum  = !wr_undo && !wr_aupd && wr_alu && alu_arith;
+    // (Nor when a load's data is written in this cycle: see lp_fire.)
+    wire        wr_sum  = !wr_undo && !wr_aupd && wr_alu && alu_arith && !lp_fire;
     reg  [31:0] res_e;
     always @* begin
         case (u_unit)
             U_LOAD:   res_e = vm;
-            U_SHIFT:  res_e = sh_res;
             U_MUL:    res_e = prod[31:0];
             U_SPEC:   res_e = sp_e;
             default:  res_e = alu_other;
         endcase
     end
-    wire [31:0] wr_early = (und_now && un0_v) ? un0_d : un_second ? un1_d :
+    wire        wr_sh   = (u_unit == U_SHIFT) && !lp_fire && !(und_now && un0_v) && !un_second;
+    wire [31:0] wr_early = wr_sh ? (wr_ah ? {16'd0, sh_res[7:0], 8'd0} : sh_res) :
+                           lp_fire ? lp_wd :
+                           (und_now && un0_v) ? un0_d : un_second ? un1_d :
                            wr_aupd ? ptr_sum : is_lea ? off :
                            wr_ah ? {16'd0, res_e[7:0], 8'd0} : res_e;
 
@@ -1395,8 +1532,15 @@ module m86b_core #(
                 rf_we   = 1'b1;
                 rf_wa   = u_a;
                 rf_lane = u_a16 ? 4'b0011 : 4'b1111;
-            end else if (u_dwe && !first && u_unit != U_STORE)
+            end else if (u_dwe && !first && u_unit != U_STORE && !ovl)
                 rf_we = 1'b1;
+        end
+        // A load's data, a cycle after the load (the uop in front
+        // writes nothing in this cycle: lp_dep).
+        if (lp_fire) begin
+            rf_we   = lp_we;
+            rf_wa   = lp_d;
+            rf_lane = lp_lane;
         end
         if (rf_wa == ZERO)
             rf_we = 1'b0;
@@ -1431,6 +1575,7 @@ module m86b_core #(
         // The first uop of a newly decoded instruction goes to the cache
         // as it moves from the ROM to execution.
         dc_fill = i_first && s1_v && !busy && !flt_now && !flushing && mode_ok && !d_priv;
+        f_imm = w[65] ? {{(32-UC_AW){w_k[UC_AW-1]}}, w_k} : i_imm;
         dc_we = dc_fill || flushing || p_kill;
         dc_wa = flushing ? fl_idx : p_kill ? p_evaddr[DC_AW-1:0] : i_lin[DC_AW-1:0];
         dc_wd = {1'b1, gen, i_lin[31:DC_AW], i_len,
@@ -1446,7 +1591,11 @@ module m86b_core #(
                  // immediate and displacement, as it does when the word
                  // runs from the ROM. Only single-uop instructions use
                  // this (the microassembler checks).
-                 w[65] ? {{(32-UC_AW){w_k[UC_AW-1]}}, w_k} : i_imm,
+                 // (A shift keeps how far to the left beside its count:
+                 // see sh_k.)
+                 (w_res[25:23] == U_SHIFT)
+                     ? {f_imm[31:13], w_res[26] ? (5'd0 - f_imm[4:0]) : f_imm[4:0], f_imm[7:0]}
+                     : f_imm,
                  w[65] ? {{(32-UC_AW){w_k[UC_AW-1]}}, w_k} : i_disp};
         if (flushing || p_kill)
             dc_wd = {DCW{1'b0}};
@@ -1468,7 +1617,7 @@ module m86b_core #(
             ur_n = q_cont;
         else if (ujump)
             ur_n = r_k;
-        else if (busy || !s1_v)
+        else if (busy_x || !s1_v)
             ur_n = upc1;
         else
             ur_n = upc1 + 1'b1;
@@ -1619,10 +1768,16 @@ module m86b_core #(
                    ((sg_we && sg_wa == 3'd2) ||
                     (u_aop == SP_FLBIT && u_cc == 4'd3 && !fl[9]));
 
+    // The uop in front ends an instruction, and that is a step now.
+    wire step_u = valid && !stall && done && !ovl &&
+                  !(u_unit == U_SPEC && (u_aop == SP_RAISE ||
+                                         (u_aop == SP_FLBIT && u_cc[3:1] == 3'd1 && if_bad)));
+
     always @(posedge clk) begin
         upc1   <= ur_a;
         inta   <= 1'b0;
         step_done <= 1'b0;
+        step_two  <= 1'b0;
         if (inta) flt_vec <= irq_vec;
         if (set_inh) inh_next <= 1'b1;
         st_chk <= d_req && d_wr && !d_io;
@@ -1642,7 +1797,7 @@ module m86b_core #(
         if (rst) begin
             // Reset continues in microcode, from word 0, which sets the
             // registers and jumps to F000:FFF0.
-            halted <= 1'b0; in_rom <= 1'b1; lk_pend <= 1'b0; rst_seq <= 1'b1;
+            halted <= 1'b0; in_rom <= 1'b1; lk_pend <= 1'b0; rst_seq <= 1'b1; lp_v <= 1'b0;
             s1_v <= 1'b1; s2_v <= 1'b0; cyc2 <= 1'b0; cyc3 <= 1'b0;
             jt_pend <= 1'b0; chk_v <= 1'b0; flt_v <= 1'b0;
             lk_eip <= 32'h0000FFF0; lk_lin <= 32'h000FFFF0; cs_base <= 32'h000F0000;
@@ -1654,7 +1809,7 @@ module m86b_core #(
             cpl <= 2'd0; tpl <= 2'd0; err <= 16'd0; in_hw <= 1'b0; sg_null <= 6'd0;
             xs <= X_IDLE; tlb_v <= 32'd0; x_cross <= 1'b0; x_wok <= 1'b0; x_dec <= 1'b0;
             xf_now <= 1'b0; un_new <= 1'b1; x_flush <= 1'b0; x_second <= 1'b0;
-            vm_ld <= 1'b0; vm_int <= 1'b0; x_io <= 2'd0; tr_lim <= 20'd0;
+            vm_ld_r <= 1'b0; vm_int_r <= 1'b0; x_io <= 2'd0; tr_lim <= 20'd0;
             sg_nw <= 6'd0; sg_nr <= 6'd0; sg_prot <= 6'h3F; sg_dpl <= 12'd0;
             chk_ok <= 1'b0; chk_p <= 1'b0; chk_a <= 1'b0; chk_sys <= 1'b0; chk_inner <= 1'b0;
             gate_trap <= 1'b0; tr_base <= 32'd0; tr_32 <= 1'b0; sel_null <= 1'b0; chk_bad <= 1'b0;
@@ -1765,8 +1920,9 @@ module m86b_core #(
                 if (&fl_idx) flushing <= 1'b0;
             end
 
-            dreq_r <= stall && !flt_now;
+            dreq_r <= (stall || lp_wait) && !flt_now;
             dwr_r  <= 1'b0;
+            if (lp_fire || flt_now) lp_v <= 1'b0;
             chk_v  <= 1'b0;
             jchk_v <= 1'b0;
             jt_pend <= 1'b0;
@@ -1801,7 +1957,7 @@ module m86b_core #(
                 s2_v <= 1'b0;
             end
 
-            if (fin) begin in_flt <= 1'b0; in_hw <= 1'b0; vm_int <= 1'b0; tpl <= (sg_we && sg_wa == 3'd1 && sg_pm) ? tpl : cpl; end
+            if (fin) begin in_flt <= 1'b0; in_hw <= 1'b0; vm_int_r <= 1'b0; tpl <= (sg_we && sg_wa == 3'd1 && sg_pm) ? tpl : cpl; end
 `ifdef M86_DBG
             if (flt_now) $display("DBG fault lim=%b ud=%b jmp=%b vec=%h eip=%h upc=%h chk_off=%h chk_lim=%h bad=%b ss=%b err=%h cr2=%h",
                                   lim_now, ud_now, jmp_bad, ud_vec, i_eip, upc1, chk_off, chk_lim, chk_bad, chk_ss, err, cr2);
@@ -1812,9 +1968,9 @@ module m86b_core #(
                 flt_vec  <= ud_now ? ud_vec : (lim_now && chk_ss && !chk_bad) ? 8'd12 : 8'd13;
                 last_exc <= ud_now ? ud_vec : (lim_now && chk_ss && !chk_bad) ? 8'd12 : 8'd13;
                 if (!(ud_now && ud_keep)) err <= 16'd0;
-                in_pm <= 1'b0; tpl <= cpl; in_hw <= 1'b0; vm_ld <= 1'b0;
+                in_pm <= 1'b0; tpl <= cpl; in_hw <= 1'b0; vm_ld_r <= 1'b0;
                 // (A fault on the way out of virtual 8086 mode: back in.)
-                if (vm_int) begin fl[17] <= 1'b1; vm_int <= 1'b0; end
+                if (vm_int) begin fl[17] <= 1'b1; vm_int_r <= 1'b0; end   // (never without VMEM)
                 in_rom <= 1'b1; lk_pend <= 1'b0; s1_v <= 1'b1; s2_v <= 1'b0;
                 cyc2 <= 1'b0; cyc3 <= 1'b0; ds <= DS_IDLE; i_first <= 1'b0;
                 dreq_r <= 1'b0; wmode_r <= 1'b0; w2 <= 1'b0;
@@ -1906,6 +2062,16 @@ module m86b_core #(
                     end
                 end
                 if (!cyc2 && !cyc3) un_new <= 1'b0;
+                if (ovl) begin
+                    lp_v    <= 1'b1;
+                    lp_we   <= u_dwe;
+                    lp_d    <= u_d;
+                    lp_lane <= lane_d;
+                    lp_ldb  <= ld_b;
+                    lp_16   <= u_cc[2];
+                    lp_size <= u_size;
+                    lp_ah   <= (u_size == 2'd0) && u_hi[2];
+                end
                 cyc2 <= first && !cyc2;
                 cyc3 <= first && cyc2;
 
@@ -1918,7 +2084,7 @@ module m86b_core #(
                             fl[0]  <= sh_cf;
                             fl[11] <= sh_of;
                             if (!sh_rot) begin
-                                fl[6] <= (sh_res == 32'd0);
+                                fl[6] <= sh_zf;
                                 fl[7] <= sh_msb;
                                 fl[2] <= sh_pf;
                                 fl[4] <= 1'b0;
@@ -2011,13 +2177,14 @@ module m86b_core #(
                             4'd5: if (pg) x_flush <= 1'b1;     // INVLPG
                             // Virtual 8086 mode: 6 its registers are
                             // being loaded; 7 into it; 8 out of it.
-                            4'd6: vm_ld <= 1'b1;
+                            4'd6: vm_ld_r <= 1'b1;
                             4'd7: begin
-                                fl[17] <= 1'b1;  vm_ld <= 1'b0;
+                                if (VMEM != 0) fl[17] <= 1'b1;
+                                vm_ld_r <= 1'b0;
                                 cpl <= 2'd3;     tpl <= 2'd3;
                             end
                             4'd8: begin
-                                vm_int <= fl[17];
+                                vm_int_r <= fl_vm;
                                 fl[17] <= 1'b0;
                             end
                             default: ;
@@ -2107,16 +2274,20 @@ module m86b_core #(
 
                 if (fin && u_br == 3'd3) begin
                     jt_pend <= 1'b1;
-                    jt_eip  <= u_a16 ? {16'd0, result[15:0]} : result;
+                    // (RET -- a load that moves the stack pointer -- jumps
+                    // to all of what it loaded: a16 is the stack's there.)
+                    jt_eip  <= (u_a16 && !u_aupd) ? {16'd0, result[15:0]} : result;
                     lk_pend <= 1'b0;
                 end else if (done) begin
                     // (A word that raises a fault ends its routine, but
                     // the instruction is not done: the fault's delivery
                     // is the step.)
-                    if (!(u_unit == U_SPEC && (u_aop == SP_RAISE ||
-                                               (u_aop == SP_FLBIT && u_cc[3:1] == 3'd1 && if_bad)))) begin
+                    // (And a load that goes on into the next cycle is
+                    // a step when its data is written.)
+                    if (step_u) begin
                         step_done <= 1'b1;
-                        dbg_insns <= dbg_insns + 32'd1;
+                        step_two  <= lp_fire;
+                        dbg_insns <= dbg_insns + (lp_fire ? 32'd2 : 32'd1);
                     end
                     inh <= inh_next || set_inh; inh_next <= 1'b0;
                     lk_eip <= eip_next; lk_lin <= lin_next; lk_pend <= 1'b1;
@@ -2127,6 +2298,13 @@ module m86b_core #(
                     in_rom  <= 1'b1;
                     lk_pend <= 1'b0;
                 end
+            end
+            // The load of the cycle before is a step now, whatever the
+            // uop in front does (if that ends too, the two are counted
+            // above).
+            if (lp_fire && !step_u) begin
+                step_done <= 1'b1;
+                dbg_insns <= dbg_insns + 32'd1;
             end
 
             // ---- the decoder ----
@@ -2330,7 +2508,8 @@ module m86b_core #(
 
             // ---- the paging unit ----
             if (done || flt_now || irq_take) un_new <= 1'b1;
-            case (xs)
+            // (Without VMEM only the DMA fetch is left of this machine.)
+            case ((VMEM != 0 || xs == X_D1 || xs == X_D2) ? xs : X_IDLE)
                 X_D1: begin
                     d_addr <= {8'd0, dma_addr};  d_size <= 2'd0;  d_io <= 1'b0;
                     dreq_r <= 1'b1;  dwr_r <= 1'b0;
@@ -2582,6 +2761,19 @@ module m86b_core #(
         end
     endtask
 
+
+    // ---- for the profile in the lockstep bench (sim/lockstep.cpp) ----
+    // What this cycle is spent on, and the uop at work: read by the
+    // simulation only (nothing in the design uses these two wires).
+    wire [47:0] prof_uop /* verilator public_flat */ = uop;
+    wire [31:0] prof_st /* verilator public_flat */ = {
+        2'd0, lp_wait, wr_aupd, s2_v, s1_v, valid00 && xl_block, rst_seq,
+        fin, p_arith && p_usec, valid && taken && (u_br != 3'd0), is_lea,
+        is_mem, busy, ext, in_rom,
+        hot, is_div && !dv_last, slow_unit, first,
+        stall, valid, st_block, valid00,
+        (ds != DS_IDLE) || miss, jt_pend, flt_now || irq_take, xs != X_IDLE,
+        sl_hold || dma_take, probing || probe_take, flushing, halted};
 endmodule
 
 `default_nettype wire

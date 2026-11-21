@@ -159,6 +159,21 @@ module ddr3_ctrl #(
 	input wire wb_cyc_i,
 	output reg wb_ack_o,
 
+	// -- The block register, for a master that wants the line -----
+	//
+	// A line fill is four word reads, and the three after the first
+	// are answered from the block register -- but each is still a
+	// bus cycle. A master that can take sixteen bytes at once reads
+	// one word and, if blk_ok_o is high in the cycle of that word's
+	// acknowledge, takes the whole block from blk_dat_o and does not
+	// ask for the rest. blk_ok_o is rdbuf_valid: low when the
+	// register does not hold the whole block (after a read that
+	// timed out, or with only some bytes written into it), and then
+	// the master carries on a word at a time. Nothing else changes;
+	// a master that ignores these two outputs sees the same bus.
+	output wire [127:0] blk_dat_o,
+	output wire blk_ok_o,
+
 	// -- PHY: status ----------------------------------------------
 	input wire phy_ready_i,      // PHY delay hardware is up
 	output reg init_done_o,      // DRAM is initialised and usable
@@ -475,6 +490,8 @@ module ddr3_ctrl #(
 	reg [127:0] rdbuf_data;
 	reg [ROW_BITS+BANK_BITS+COL_BITS-4:0] rdbuf_tag;
 	reg rdbuf_valid;
+	assign blk_dat_o = rdbuf_data;
+	assign blk_ok_o = rdbuf_valid && !rdbuf_off_i;
 
 	// 2 word + 7 block + 3 bank + ROW_BITS row bits must fit the 27-bit
 	// word address -- 512MB, the main-memory window. More rows than

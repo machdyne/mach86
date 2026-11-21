@@ -2,8 +2,8 @@
 #
 # `make help` lists the targets.
 
-.PHONY: lakritz help check check-docs check-sim check-rtl check-b vectors \
-        rtl-vectors vectors-b dos rtl-dos dos-b check-b-boot synth synth-b dhry dhry-b check-tb check-soc check-pm check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse check-soc-train check-soc-main card check-card soc-dos check-gate gate-dos sergei_ml2 sdcard
+.PHONY: lakritz help check check-docs check-sim check-rtl check-b check-fpu check-fpu-rtl vectors \
+        rtl-vectors vectors-b dos rtl-dos dos-b check-b-boot synth synth-b dhry dhry-b check-tb check-soc check-pm check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse check-soc-train check-soc-main card check-card soc-dos check-gate gate-dos sergei_ml2 sergei_ml2_c sergei_ml2_cf sdcard
 
 help:
 	@echo "Mach86 targets:"
@@ -49,10 +49,16 @@ help:
 	@echo "  make synth-b      synthesise, place and route CPU design B"
 	@echo "                    for Lakritz's FPGA; report size and clock"
 
-check: check-docs check-sim check-rtl check-b check-b-boot check-b-nowin check-tb check-soc check-486 check-pm check-pm2 check-pm3 check-pg check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse check-soc-train
+check: check-docs check-sim check-rtl check-b check-b-boot check-b-nowin check-b-lak check-c-boot check-tb check-soc check-486 check-fpu check-fpu-rtl check-pm check-pm2 check-pm3 check-pg check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse check-soc-train
 
 check-docs:
 	python3 tools/checkdocs.py
+
+check-fpu:
+	$(MAKE) -C sim check-fpu
+
+check-fpu-rtl:
+	$(MAKE) -C sim check-fpu-rtl
 
 check-sim:
 	$(MAKE) -C sim check
@@ -77,8 +83,28 @@ rtl-dos:
 check-b-boot:
 	$(MAKE) -C sim check-b-boot
 
+# What clock design C's core alone can run at on the slowest 45F
+# (docs/cpu_c.md). FMAX_PH: clock cycles for each of design B's;
+# FMAX_MHZ: what to ask the router for.
+FMAX_PH  ?= 3
+FMAX_MHZ ?= 60
+fmax-c:
+	mkdir -p output/fmax
+	python3 sw/ucode/m86b_ucode.py output/fmax > /dev/null
+	cd output/fmax && yosys -q -l syn.log -p "read_verilog ../../rtl/cpu/m86_alu.v ../../rtl/cpu/m86c_core.v ../../rtl/cpu/m86_fmax.v; chparam -set PH $(FMAX_PH) m86_fmax; synth_ecp5 -top m86_fmax -abc9 -nowidelut -json fmax.json"
+	cd output/fmax && nextpnr-ecp5 --45k --package CABGA381 --speed 6 --json fmax.json \
+	  --freq $(FMAX_MHZ) --seed 1 $(PNR_OPT) --timing-allow-fail -l pnr.log -q || true
+	@grep "Max frequency for clock" output/fmax/pnr.log | tail -1
+
 check-b-nowin:
 	$(MAKE) -C sim check-b-nowin
+
+check-b-lak:
+	$(MAKE) -C sim check-b-lak
+
+# Design C's first form (docs/cpu_c.md): the BIOS test in lockstep.
+check-c-boot:
+	$(MAKE) -C sim check-c-boot
 
 dos-b:
 	$(MAKE) -C sim dos-b
@@ -208,7 +234,7 @@ sdcard:
 # the DDR3 PHY's parameterised I/O cells late in synth_ecp5, after the
 # other modules are gone, and fails (Zeitlos's Makefile has the story).
 BOARD_OUT = output/sergei_ml2
-RTL_BOARD = rtl/cpu/m86_alu.v rtl/cpu/m86b_core.v $(wildcard rtl/soc/*.v) \
+RTL_BOARD = rtl/cpu/m86_alu.v rtl/cpu/m86b_core.v rtl/cpu/m86c_core.v rtl/cpu/m86_fpu.v rtl/cpu/m86_fparith.v $(wildcard rtl/soc/*.v) \
             $(addprefix rtl/ext/zeitlos/,pll2.v ddr3.v ddr3_ctrl.v \
               ddr3_phy_ecp5.v ddr3_rdasm.v ddr3_clk.v ddr3_phy_init.v audio_spdif.v audio_out.v \
               ddmi_island.v tmds_encoder.v) \
@@ -216,9 +242,11 @@ RTL_BOARD = rtl/cpu/m86_alu.v rtl/cpu/m86b_core.v $(wildcard rtl/soc/*.v) \
 # Synthesis of the board design. Yosys 0.69 has crashed in this now and
 # then (a segmentation fault, not the same place twice, gone on the next
 # run), so the rule below tries twice.
-# The placement seed: of four tried in round 19 (31.2 to 32.9 MHz for
-# 31.5; one fails) this was the best.
-BOARD_SEED ?= 2
+# The placement seed: of three tried in round 39 (33.6, 34.7 and 33.8
+# MHz for 33.16) this was the best.
+BOARD_SEED ?= 1
+BOARD_DEFS ?=
+BOARD_UCODE ?=
 # The placer is told to weigh timing three times as heavily as it does by
 # itself: on the Sergei that is worth about 1 MHz of the CPU clock.
 PNR_OPT ?= --placer-heap-timingweight 30
@@ -228,7 +256,7 @@ PNR_OPT ?= --placer-heap-timingweight 30
 USB_ROM_IN_LOGIC = setattr -set rom_style \"logic\" usb_hid_host_rom/m:mem;
 
 define SYNTH_BOARD
-yosys -q -l syn.log -p "read_verilog -DOSC48 \
+yosys -q -l syn.log -p "read_verilog -DOSC48 $(BOARD_DEFS) \
   $(addprefix ../../,$(RTL_BOARD)) ../../rtl/boards/sergei_ml2.v; \
   $(USB_ROM_IN_LOGIC) \
   hierarchy -top sergei_ml2; write_rtlil elab.il; design -reset; \
@@ -239,12 +267,13 @@ endef
 # A bitstream for Lakritz (LFE5U-25F, SDRAM): output/lakritz/mach86.bit.
 # Not run on a board (docs/boards.md).
 LAK_OUT = output/lakritz
-RTL_LAK = rtl/cpu/m86_alu.v rtl/cpu/m86b_core.v $(wildcard rtl/soc/*.v) \
+RTL_LAK = rtl/cpu/m86_alu.v rtl/cpu/m86b_core.v rtl/cpu/m86c_core.v rtl/cpu/m86_fpu.v rtl/cpu/m86_fparith.v $(wildcard rtl/soc/*.v) \
           $(addprefix rtl/ext/zeitlos/,sdram_kianv.v audio_out.v ddmi_island.v tmds_encoder.v) \
           rtl/ext/usb_hid_host/usb_hid_host.v rtl/ext/usb_hid_host/usb_hid_host_rom.v
 LAK_SEED ?= 3
+LAK_DEFS ?=
 define SYNTH_LAK
-yosys -q -l syn.log -p "read_verilog \
+yosys -q -l syn.log -p "read_verilog $(LAK_DEFS) \
   $(addprefix ../../,$(RTL_LAK)) ../../rtl/boards/lakritz.v; \
   $(USB_ROM_IN_LOGIC) \
   synth_ecp5 -top lakritz -abc9 -nowidelut -json mach86.json; stat"
@@ -268,10 +297,21 @@ lakritz:
 	cd $(LAK_OUT) && ecppack --compress --freq 2.4 mach86.config --bit mach86.bit
 	@ls -l $(LAK_OUT)/mach86.bit
 
+# The same board with design C for a processor, at 48.46 MHz
+# (docs/cpu_c.md): output/sergei_ml2_c/mach86.bit.
+sergei_ml2_c:
+	$(MAKE) sergei_ml2 BOARD_OUT=output/sergei_ml2_c BOARD_DEFS="-DM86_CPU_C $(C_DEFS)"
+
+# ... and with the floating-point unit (docs/fpu.md): a 486DX.
+# output/sergei_ml2_cf/mach86.bit.
+sergei_ml2_cf:
+	$(MAKE) sergei_ml2 BOARD_OUT=output/sergei_ml2_cf BOARD_UCODE=fpu \
+	  BOARD_DEFS="-DM86_CPU_C -DM86_CPU_FPU $(C_DEFS)"
+
 sergei_ml2:
 	@mkdir -p $(BOARD_OUT)
 	$(MAKE) -C sim ../output/bios/bios.bin
-	python3 sw/ucode/m86b_ucode.py $(BOARD_OUT) > /dev/null
+	python3 sw/ucode/m86b_ucode.py $(BOARD_OUT) $(BOARD_UCODE) > /dev/null
 	python3 tools/lanes.py output/bios/bios.bin $(BOARD_OUT)/rom 0x4000 16
 	python3 tools/mkfont.py sw/font/font16.mem $(BOARD_OUT)/font.hex
 	python3 tools/mkopl.py $(BOARD_OUT)/opl_rom.hex

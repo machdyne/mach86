@@ -34,6 +34,20 @@
 `ifndef M86_TOP
 `define M86_TOP lakritz
 `endif
+// What of the processor this board builds (rtl/cpu/m86b_core.v): the
+// decoder's window; paging, virtual 8086 mode and the I/O permission
+// bitmap (left out: about 2,500 LUTs that DOS and DOOM do not use);
+// loads that let the next instruction start. -DM86_VMEM=1 builds a
+// Lakritz with all of protected mode.
+`ifndef M86_VMEM
+`define M86_VMEM 0
+`endif
+`ifndef M86_WIN
+`define M86_WIN 1
+`endif
+`ifndef M86_OVL
+`define M86_OVL 1
+`endif
 module `M86_TOP (
     input  wire CLK_48,
     output wire LED_B,
@@ -154,7 +168,8 @@ module `M86_TOP (
     m86_soc #(.CLK_HZ(33157895), .BAUD(1000000),
               .MAIN_MEM(1), .MEM_AW(25), .MEM_TRAIN(0),
               .CACHE_LINE_BITS(10), .EXT_KB(31488),
-              .VGA_EXT(1), .VGA_BRAM(0), .CPU_WIN(0)) soc (
+              .VGA_EXT(1), .VGA_BRAM(0), .CPU_WIN(`M86_WIN), .CPU_VMEM(`M86_VMEM),
+              .CPU_OVL(`M86_OVL)) soc (
         .clk(clk), .rst(rst), .vclk(pclk),
         .v_r(v_r), .v_g(v_g), .v_b(v_b),
         .v_hsync(v_hs), .v_vsync(v_vs), .v_de(v_de),

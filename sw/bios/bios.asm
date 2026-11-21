@@ -265,6 +265,30 @@ post:   cli
         dec     bx
         mov     [BDA_MEMSIZE], bx
         mov     word [BDA_EQUIP], 0020h ; 80x25 colour text
+        ; A floating-point unit (a 486DX: design C with its FPU)? It
+        ; answers FNINIT and FNSTSW; without one the two do nothing.
+        ; Then the equipment word says so, and its error line, which a
+        ; PC has on interrupt 13 (vector 75h), is let through.
+        push    bp
+        fninit
+        push    word 5A5Ah
+        mov     bp, sp
+        fnstsw  [bp]
+        pop     ax
+        pop     bp
+        test    ax, ax
+        jnz     .nofpu
+        or      word [BDA_EQUIP], 0002h
+        in      al, PIC2_DATA
+        and     al, 0DFh
+        out     PIC2_DATA, al
+        push    ds
+        xor     ax, ax
+        mov     ds, ax
+        mov     word [75h*4], irq_fpu
+        mov     [75h*4+2], cs
+        pop     ds
+.nofpu:
         mov     word [BDA_KBHEAD], BDA_KBBUF
         mov     word [BDA_KBTAIL], BDA_KBBUF
         mov     word [BDA_KBSTART], BDA_KBBUF
@@ -429,6 +453,21 @@ puthex: push    ax
 ; ====================================================================
 
 int_dummy:
+        iret
+
+; Interrupt 13: the floating-point unit has an exception that is not
+; masked. As an AT's BIOS does: let the unit go on (port F0h), end the
+; interrupt, and hand it to whoever has the NMI vector, which is where
+; an 8087's error went and where programs still look for it.
+irq_fpu:
+        push    ax
+        xor     al, al
+        out     0F0h, al
+        mov     al, 20h
+        out     PIC2_CMD, al
+        out     PIC1_CMD, al
+        pop     ax
+        int     02h
         iret
 
 ; Hardware interrupt on the second controller with no handler.

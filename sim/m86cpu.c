@@ -20,7 +20,7 @@
 
 enum { EXC_DE = 0, EXC_DB = 1, EXC_BP = 3, EXC_OF = 4, EXC_BR = 5,
        EXC_UD = 6, EXC_NM = 7, EXC_DF = 8, EXC_TS = 10, EXC_NP = 11,
-       EXC_SS = 12, EXC_GP = 13, EXC_PF = 14 };
+       EXC_SS = 12, EXC_GP = 13, EXC_PF = 14, EXC_MF = 16 };
 
 const char *const m86_class_name[M86_CL_COUNT] = {
     "register to register", "load", "arithmetic with memory source",
@@ -1621,7 +1621,7 @@ static void exec_0f(m86 *c)
         decode_modrm(c);
         privileged(c);
         if (c->reg == 0) {
-            c->cr0 = R(c->rm);
+            c->cr0 = R(c->rm) | (c->has_fpu ? 0x10 : 0);
             if (!(c->cr0 & 1))
                 c->s.cpl = 0;
         } else if (c->reg == 2) {
@@ -1767,6 +1767,11 @@ static int lockable(int op, int reg)
     default: return 0;
     }
 }
+
+/* The floating-point unit: its arithmetic (compiled in here, so that
+ * everything that builds the processor has it) and its instructions. */
+#include "m86fpu.c"
+#include "m86x87.h"
 
 static void exec(m86 *c)
 {
@@ -2037,6 +2042,8 @@ static void exec(m86 *c)
     case 0x9B:                  /* WAIT */
         if ((c->cr0 & 0xA) == 0xA)
             fault(c, EXC_NM);
+        if (c->has_fpu)
+            fp_check(c);
         break;
     case 0x9C:
         if ((FLAGS & M86_VM) && IOPL < 3)
@@ -2180,8 +2187,12 @@ static void exec(m86 *c)
                rd_mem(c, c->seg_ovr >= 0 ? c->seg_ovr : M86_DS, off, 1));
         break;
     }
-    case 0xD8 ... 0xDF:         /* coprocessor escape: there is none */
+    case 0xD8 ... 0xDF:         /* coprocessor escape */
         decode_modrm(c);
+        if (c->has_fpu) {
+            x87(c, op);
+            break;
+        }
         if (c->cr0 & 0xC)       /* EM or TS */
             fault(c, EXC_NM);
         break;
@@ -2401,8 +2412,9 @@ void m86_reset(m86 *c)
     c->s.seg[M86_CS].base = 0x000F0000;
     c->s.eip = 0xFFF0;
     c->s.eflags = 2;
-    c->s.r[M86_EDX] = 0x0420;           /* a 486SX */
-    c->cr0 = 0;
+    c->s.r[M86_EDX] = c->has_fpu ? 0x0430 : 0x0420;     /* a 486DX2, or a 486SX */
+    c->cr0 = c->has_fpu ? 0x10 : 0;                     /* (ET: the FPU is a 387's kind) */
+    m86_fpu_reset(c);
     c->cr2 = c->cr3 = 0;
     memset(c->dr, 0, sizeof c->dr);
     c->gdtr.base = c->idtr.base = 0;
@@ -2465,6 +2477,8 @@ static void deliver_fault(m86 *c, volatile int vec)
     }
 }
 
+#include "m86pipe.h"
+
 void m86_step(m86 *c)
 {
     if (c->shutdown || c->unsupported)
@@ -2483,6 +2497,7 @@ void m86_step(m86 *c)
         else
             vec = c->irq_ack(c->bus);
         c->halted = 0;
+        c->fp_stop = 0;
         int f = setjmp(c->fault_jmp);
         if (f)
             deliver_fault(c, f - 1);
@@ -2490,7 +2505,7 @@ void m86_step(m86 *c)
             interrupt(c, vec, c->s.eip, INT_EXT);
         return;
     }
-    if (c->halted)
+    if (c->halted || c->fp_stop)
         return;
 
     c->os = c->s.seg[M86_CS].d ? 4 : 2;
@@ -2529,6 +2544,8 @@ void m86_step(m86 *c)
             }
         }
     }
+    /* M86_PIPE: the cycles a pipelined core would take (m86pipe.h). */
+    pipe_step(c);
     /* M86_DC=1: how a decoded-instruction cache of a few shapes would
      * do on this program (misses per cent, every 100 million
      * instructions): 2,048, 4,096 and 8,192 entries indexed by the

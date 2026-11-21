@@ -17,6 +17,7 @@
 
 #include <stdint.h>
 #include <setjmp.h>
+#include "m86fpu.h"
 
 enum { M86_EAX, M86_ECX, M86_EDX, M86_EBX, M86_ESP, M86_EBP, M86_ESI, M86_EDI };
 enum { M86_ES, M86_CS, M86_SS, M86_DS, M86_FS, M86_GS };
@@ -86,6 +87,20 @@ struct m86 {
     int shutdown;       /* fault while delivering a fault: the CPU has stopped */
     int unsupported;    /* software asked for something this level lacks */
     int irq_inhibit;    /* one instruction after MOV SS / POP SS / STI */
+
+    /* The floating-point unit (a 486DX's), if has_fpu was set before
+     * the reset: docs/fpu.md. */
+    int has_fpu;
+    struct {
+        m86f80   st[8];         /* the registers, by number (not by stack position) */
+        uint16_t cw, sw;        /* control and status words (the stack's top is in sw) */
+        uint8_t  empty;         /* bit i: register i is empty */
+        uint16_t fcs, fds, fop; /* the last instruction: its segments and opcode, */
+        uint32_t fip, fdp;      /* and where it and its operand were */
+    } fp;
+    int ferr;           /* an exception that is not masked is waiting (the FERR line) */
+    int ignne;          /* set from outside: go on in spite of it (the IGNNE line) */
+    int fp_stop;        /* an instruction is waiting for an interrupt because of it */
 
     /* The bus. Addresses are physical; `bus` is passed back. */
     void    *bus;

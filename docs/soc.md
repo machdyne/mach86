@@ -60,7 +60,7 @@ SDRAM controller. Between it and the CPU is a cache,
 `rtl/soc/m86_dcache.v`:
 
 - Direct-mapped, lines of 16 bytes — one DDR3 burst — and 2^
-  `CACHE_LINE_BITS` of them: 64 KB on Sergei ML2.
+  `CACHE_LINE_BITS` of them: 32 KB on Sergei ML2, 16 KB on Lakritz.
 - Any access the CPU makes: one, two or four bytes at any address. An
   access that straddles two lines looks both up at once.
 - **A read that hits costs the CPU no waiting.** The core says a cycle
@@ -84,12 +84,81 @@ SDRAM controller. Between it and the CPU is a cache,
   if that was changed.
 
 The memory side is a word at a time (`m_req`, `m_we`, `m_addr`,
-`m_wdata`, `m_rdata`, `m_ack`), on the CPU's clock. On Sergei ML2
-that goes through `rtl/soc/m86_xclk.v` — one request at a time
-across to the 48 MHz clock that Zeitlos's DDR3 controller makes for
-itself — and into `rtl/ext/zeitlos/ddr3.v`. The controller's own
-block register answers the second, third and fourth word of a line
-without going to the memory again.
+`m_wdata`, `m_rdata`, `m_ack`), on the CPU's clock, and always a
+whole line: four words read to fill one, four written to put a
+changed one back.
+
+**On Sergei ML2 the line crosses to the memory's clock once**
+(`rtl/soc/m86_xline.v`, round 40). Zeitlos's DDR3 controller runs on
+a 48 MHz clock that its PHY makes, unrelated to the CPU's, and has a
+Wishbone port of single words. Until round 40 each of a line's words
+went across by itself (`rtl/soc/m86_xclk.v`: about three cycles of
+each clock a time), and a changed line cost four DRAM writes of the
+same sixteen bytes, since the controller writes a whole block for
+every word stored, and often a DRAM read before them. Now:
+
+- a line is asked for once: the far side reads its first word, and
+  takes the other twelve bytes from the controller's block register
+  in the same cycle (the one addition to Zeitlos's files:
+  [`rtl/ext/zeitlos/README.md`](../rtl/ext/zeitlos/README.md));
+- the four words of a changed line are collected on the CPU's side,
+  go across together and are written to the controller one after
+  the other. They are still four DRAM writes (see below);
+- words of the line that is in the bridge, and written words before
+  a line's last, are answered in the cycle they are asked.
+
+| In the CPU's cycles, simulated (`sim/m86_ddr3_tb.v`'s parts, 31.5 against 48 MHz) | Before | Round 40 |
+|---|---:|---:|
+| A read that hits | 2 | 2 |
+| A miss, nothing to put back | 41 to 47 (1 DRAM read) | 22 (1 read) |
+| A miss that puts a changed line back | 82 to 90 (1 or 2 reads, 4 writes) | 63 to 64 (1 read, 4 writes) |
+| ... with the controller's write combining (`-DM86_WCOMBINE=1`) | | 49 to 50 (1 read, 1 write) |
+
+**Write combining is off.** Zeitlos's controller can collect the
+four words and write the block once (`WCOMBINE`), and with the new
+bridge the words arrive close enough together for it to (through
+the old bridge they did not: it was tried). But that logic is the
+longest path on the controller's 48 MHz clock: the Sergei build then
+met that clock by 0.02 MHz on one placement and missed it by a
+quarter on the next, where without it the same clock has been
+between 48.6 and 81 MHz. The memory's controller is the last place
+for a clock that is only just met, and the gain is small (one miss
+in seven puts a line back in DOOM), so it stays off. The right
+answer is a block write beside the block read in the controller,
+which would be a second patch to Zeitlos.
+
+**What that is worth depends on the program.** The lockstep bench
+carries a model of this cache ([verification.md](verification.md#where-the-cycles-go))
+and counts:
+
+| | DOS boot and test | DOOM (demo play) |
+|---|---:|---:|
+| Accesses to main memory, an instruction | 1.02 | 0.53 |
+| Misses an instruction, 16 KB (Lakritz) | 0.0011 | 0.0244 |
+| ... 32 KB (Sergei ML2) | 0.0008 | 0.0169 |
+| ... 64 KB | 0.0005 | 0.0100 |
+| ... 128 KB | 0.0003 | 0.0070 |
+| ... 32 KB in two ways | 0.0008 | 0.0143 |
+| Misses that put a changed line back, 32 KB | 57% | 14% |
+
+So for DOS itself the memory was 2% of the time and is 1%. For DOOM
+on a Sergei the old bridge cost 0.85 cycles for every instruction,
+beside the 1.9 the processor took: **a third of the machine's time
+went to cache misses.** The new one costs 0.47. With round 40's
+processor that is about 2.1 cycles an instruction where there were
+2.7: **DOOM about 28% faster on the board, by this arithmetic.** It
+is arithmetic: nobody has measured DOOM on a board before or after
+(`doom -timedemo demo1`, [running.md](running.md)), the figures
+leave out the display's use of the memory and the card, and the new
+bridge has run in simulation only. `-DM86_XLINE=0` in `BOARD_DEFS`
+builds the old one.
+
+A larger cache would help DOOM as much again (64 KB: 0.30 cycles an
+instruction where 32 KB has 0.47) and there is no block RAM for it:
+the Sergei build has 11 blocks free and 32 KB more needs 16.
+
+Lakritz's SDRAM is on the CPU's clock and has no bridge; what a miss
+costs there has not been measured.
 
 The memory port (E4h, E8h, ECh) shares the memory side with the
 cache and has a second, similar path (`x_`) to the controller's

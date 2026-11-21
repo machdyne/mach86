@@ -62,7 +62,8 @@ mode range, and reset starts at FFFF:0000h, which is the same place.
 | 3F8h–3FFh | COM1 (16550) | 3 |
 
 Not present: floppy controller (3F0h–3F7h), ATA (1F0h–1F7h, 3F6h),
-parallel port (378h–37Ah), coprocessor (0F0h–0FFh). Reads of absent
+parallel port (378h–37Ah), coprocessor (0F0h–0FFh: the model has
+port F0h with `-fpu`, [fpu.md](fpu.md); no board has). Reads of absent
 ports return FFh.
 
 The memory port reaches the main memory and its controller directly,

@@ -1,0 +1,53 @@
+--- a/rtl/mem/ddr3.v	2026-11-20 18:25:02.866930643 +0100
++++ b/rtl/mem/ddr3.v	2026-11-20 18:25:02.870404472 +0100
+@@ -77,6 +77,9 @@
+ 	input wire wb_stb_i,
+ 	input wire wb_cyc_i,
+ 	output wire wb_ack_o,
++	// the controller's block register: see ddr3_ctrl.v
++	output wire [127:0] blk_dat_o,
++	output wire blk_ok_o,
+ 
+ 	// -- registers -------------------------------------------------
+ 	input wire [1:0] reg_adr_i,
+@@ -158,6 +161,7 @@
+ 		.wb_adr_i(wb_adr_i), .wb_dat_i(wb_dat_i), .wb_dat_o(wb_dat_o),
+ 		.wb_we_i(wb_we_i), .wb_sel_i(wb_sel_i),
+ 		.wb_stb_i(wb_stb_i), .wb_cyc_i(wb_cyc_i), .wb_ack_o(wb_ack_o),
++		.blk_dat_o(blk_dat_o), .blk_ok_o(blk_ok_o),
+ 		.phy_ready_i(phy_ready_i),
+ 		.init_done_o(init_done),
+ 		.rd_timeout_o(rd_timeout),
+--- a/rtl/mem/ddr3_ctrl.v	2026-11-20 18:25:02.865208768 +0100
++++ b/rtl/mem/ddr3_ctrl.v	2026-11-20 18:25:02.868607613 +0100
+@@ -159,6 +159,21 @@
+ 	input wire wb_cyc_i,
+ 	output reg wb_ack_o,
+ 
++	// -- The block register, for a master that wants the line -----
++	//
++	// A line fill is four word reads, and the three after the first
++	// are answered from the block register -- but each is still a
++	// bus cycle. A master that can take sixteen bytes at once reads
++	// one word and, if blk_ok_o is high in the cycle of that word's
++	// acknowledge, takes the whole block from blk_dat_o and does not
++	// ask for the rest. blk_ok_o is rdbuf_valid: low when the
++	// register does not hold the whole block (after a read that
++	// timed out, or with only some bytes written into it), and then
++	// the master carries on a word at a time. Nothing else changes;
++	// a master that ignores these two outputs sees the same bus.
++	output wire [127:0] blk_dat_o,
++	output wire blk_ok_o,
++
+ 	// -- PHY: status ----------------------------------------------
+ 	input wire phy_ready_i,      // PHY delay hardware is up
+ 	output reg init_done_o,      // DRAM is initialised and usable
+@@ -475,6 +490,8 @@
+ 	reg [127:0] rdbuf_data;
+ 	reg [ROW_BITS+BANK_BITS+COL_BITS-4:0] rdbuf_tag;
+ 	reg rdbuf_valid;
++	assign blk_dat_o = rdbuf_data;
++	assign blk_ok_o = rdbuf_valid && !rdbuf_off_i;
+ 
+ 	// 2 word + 7 block + 3 bank + ROW_BITS row bits must fit the 27-bit
+ 	// word address -- 512MB, the main-memory window. More rows than

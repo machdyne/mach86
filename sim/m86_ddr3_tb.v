@@ -2,7 +2,8 @@
  * Mach86 -- test bench for the main memory path on a DDR3 board:
  *
  *   cache (rtl/soc/m86_dcache.v)
- *     -> clock crossing (rtl/soc/m86_xclk.v), 31.5 MHz to 48 MHz
+ *     -> clock crossing, a line at a time (rtl/soc/m86_xline.v),
+ *        31.5 MHz to 48 MHz
  *       -> Zeitlos's DDR3 controller and registers (rtl/ext/zeitlos/ddr3.v)
  *         -> Zeitlos's behavioural PHY and DRAM model, which checks the
  *            DDR3 protocol and timing
@@ -56,10 +57,18 @@ module m86_ddr3_tb;
     wire        wb_stb, wb_we, wb_ack;
     wire [23:0] wb_adr;
     wire [31:0] wb_dat_w, wb_dat_r;
-    m86_xclk #(.AW(24)) xm (
-        .a_clk(clk), .a_rst(rst), .a_req(m_req), .a_we(m_we),
-        .a_addr({{(26-AW){1'b0}}, m_addr}), .a_wdata(m_wdata),
+    // (raw: single words past the cache, as the BIOS's memory port makes.)
+    reg           raw = 0, r_req = 0, r_we = 0;
+    reg  [23:0]   r_addr = 0;
+    reg  [31:0]   r_wdata = 0;
+    wire [127:0]  blk;
+    wire          blk_ok;
+    m86_xline #(.AW(24)) xm (
+        .a_clk(clk), .a_rst(rst), .a_req(raw ? r_req : m_req), .a_we(raw ? r_we : m_we),
+        .a_raw(raw),
+        .a_addr(raw ? r_addr : {{(26-AW){1'b0}}, m_addr}), .a_wdata(raw ? r_wdata : m_wdata),
         .a_rdata(m_rdata), .a_ack(m_ack),
+        .b_blk(blk), .b_blk_ok(blk_ok),
         .b_clk(clk48), .b_rst(rst48), .b_stb(wb_stb), .b_we(wb_we),
         .b_addr(wb_adr), .b_wdata(wb_dat_w), .b_rdata(wb_dat_r), .b_ack(wb_ack));
 
@@ -82,13 +91,17 @@ module m86_ddr3_tb;
     wire        d_ras_n, d_cas_n, d_we_n, d_cs_n, d_cke, d_odt, d_reset_n, d_ck;
     wire [1:0]  d_dm, d_dqs;
     wire [15:0] d_dq;
-    ddr3 #(.ROW_BITS(15), .TRFC_NS(260), .WCOMBINE(0)) mem (
+`ifndef WCOMBINE
+`define WCOMBINE 0
+`endif
+    ddr3 #(.ROW_BITS(15), .TRFC_NS(260), .WCOMBINE(`WCOMBINE)) mem (
         .clk_i(clk48), .rst_i(rst48),
         .eclk_i(ck), .ddrdel_i(1'b0), .pause_i(1'b0), .phy_rst_i(rst48),
         .phy_ready_i(1'b1), .pll_locked_i(1'b1),
         .wb_adr_i({3'b000, wb_adr}), .wb_dat_i(wb_dat_w), .wb_dat_o(wb_dat_r),
         .wb_we_i(wb_we), .wb_sel_i(4'b1111), .wb_stb_i(wb_stb),
         .wb_cyc_i(wb_stb), .wb_ack_o(wb_ack),
+        .blk_dat_o(blk), .blk_ok_o(blk_ok),
         .reg_adr_i(rg_adr), .reg_dat_i(rg_dat_w), .reg_dat_o(rg_dat_r),
         .reg_we_i(rg_we), .reg_stb_i(rg_stb), .reg_cyc_i(rg_stb),
         .reg_ack_o(rg_ack),
@@ -150,6 +163,31 @@ module m86_ddr3_tb;
             $display("ddr3: control reads %h", xq); errors = errors + 1;
         end
         reg_op(1, 2'd2, 32'd0);
+
+        // Single words past the cache, in no order, and back: above
+        // what the cache will use.
+        raw = 1;
+        for (n = 0; n < 64; n = n + 1) begin
+            r_addr <= 24'h100000 + ((n * 7) & 63); r_wdata <= 32'hC0DE0000 + ((n * 7) & 63);
+            r_we <= 1; r_req <= 1;
+            @(posedge clk);
+            while (!m_ack) @(posedge clk);
+            r_req <= 0;
+            @(posedge clk);
+        end
+        for (n = 0; n < 64; n = n + 1) begin
+            r_addr <= 24'h100000 + ((n * 5) & 63); r_we <= 0; r_req <= 1;
+            @(posedge clk);
+            while (!m_ack) @(posedge clk);
+            if (m_rdata !== 32'hC0DE0000 + ((n * 5) & 63)) begin
+                errors = errors + 1;
+                if (errors < 10) $display("single word %0d: got %h", (n * 5) & 63, m_rdata);
+            end
+            r_req <= 0;
+            @(posedge clk);
+        end
+        raw = 0;
+        @(posedge clk);
 
         // The memory holds nothing yet: fill it, a whole line at a time.
         for (n = 0; n < (1 << AW); n = n + 4) begin

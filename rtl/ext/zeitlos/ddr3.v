@@ -77,6 +77,9 @@ module ddr3 #(
 	input wire wb_stb_i,
 	input wire wb_cyc_i,
 	output wire wb_ack_o,
+	// the controller's block register: see ddr3_ctrl.v
+	output wire [127:0] blk_dat_o,
+	output wire blk_ok_o,
 
 	// -- registers -------------------------------------------------
 	input wire [1:0] reg_adr_i,
@@ -158,6 +161,7 @@ module ddr3 #(
 		.wb_adr_i(wb_adr_i), .wb_dat_i(wb_dat_i), .wb_dat_o(wb_dat_o),
 		.wb_we_i(wb_we_i), .wb_sel_i(wb_sel_i),
 		.wb_stb_i(wb_stb_i), .wb_cyc_i(wb_cyc_i), .wb_ack_o(wb_ack_o),
+		.blk_dat_o(blk_dat_o), .blk_ok_o(blk_ok_o),
 		.phy_ready_i(phy_ready_i),
 		.init_done_o(init_done),
 		.rd_timeout_o(rd_timeout),

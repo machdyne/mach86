@@ -39,7 +39,12 @@
  */
 module m86_dcache #(
     parameter AW = 26,              // address bits of the memory: 2**AW bytes
-    parameter LINE_BITS = 12        // 2**LINE_BITS lines of 16 bytes
+    parameter LINE_BITS = 12,       // 2**LINE_BITS lines of 16 bytes
+    // 1: whether the line is here is known a cycle later, from a
+    // register. The tags come out of block RAM 5 ns into the cycle,
+    // and at design C's clock that is too late to decide everything
+    // else by. Every access then takes a cycle longer.
+    parameter LATE = 0
 ) (
     input  wire          clk,
     input  wire          rst,
@@ -165,9 +170,14 @@ module m86_dcache #(
     wire          s_drop  = s_v && s_early && !bus_rd;
     assign        s_ok    = s_v && !s_drop;
 
-    assign b_done = s_drop || (s_ok && hit && run && !(s_wr && s_cross));
-    assign ack    = s_ok && !s_wr && hit && run;
-    assign ack_any = s_v && !s_wr && hit && run;
+    reg           s_hv, hit_r, hita_r;      // LATE: the answer is known; what it is
+    wire          known   = (LATE == 0) || s_hv;
+    wire          hit_k   = (LATE != 0) ? hit_r : hit;      // (to be looked at when known)
+    wire          hita_k  = (LATE != 0) ? hita_r : hit_a;
+    wire          hit_u   = known && hit_k;
+    assign b_done = s_drop || (s_ok && hit_u && run && !(s_wr && s_cross));
+    assign ack    = s_ok && !s_wr && hit_u && run;
+    assign ack_any = s_v && !s_wr && hit_u && run;
     // Words in common, of 2**WB (the tags are not compared: a clash
     // too many costs a cycle).
     function overlap(input [AW-1:0] a0, input [AW-1:0] a1,
@@ -209,7 +219,7 @@ module m86_dcache #(
     end
 
     // Dirty bits: set by a write that hits, cleared by a fetch.
-    wire          store_hit = s_ok && s_wr && hit && run;
+    wire          store_hit = s_ok && s_wr && hit_u && run;
     wire          d_we  = store_hit || (st == ST_DIRTY2) || tag_we;
     wire [IB-1:0] d_idx = tag_we ? f_idx : (st == ST_DIRTY2) ? s_idx_b :
                           store_hit ? s_idx_a : f_idx;
@@ -293,13 +303,18 @@ module m86_dcache #(
         case (st)
             ST_RUN: begin
                 s_early <= 1'b0;
-                if (s_ok && !hit) begin
+                if (s_ok && !known) begin
+                    s_hv   <= 1'b1;
+                    hit_r  <= hit;
+                    hita_r <= hit_a;
+                end else if (s_ok && !hit_k) begin
                     // A miss: bring in the first line that is not here.
-                    second <= hit_a;
+                    second <= hita_k;
                     st <= ST_VICTIM;
                 end else if (s_ok && s_wr && s_cross) begin
                     st <= ST_DIRTY2;        // the second line's dirty bit
                 end else begin
+                    s_hv <= 1'b0;
                     s_v <= take_fifo || take_wr || take_rd || take_erd;
                     s_early <= !take_fifo && !take_wr && !take_rd && take_erd;
                     s_wr <= take_fifo || take_wr;
@@ -341,13 +356,17 @@ module m86_dcache #(
                         st <= ST_REPLAY;
                 end
             end
-            ST_REPLAY: st <= ST_RUN;        // the operation is looked up again
+            ST_REPLAY: begin                // the operation is looked up again
+                s_hv <= 1'b0;
+                st <= ST_RUN;
+            end
             default: st <= ST_RUN;
         endcase
 
         if (rst) begin
             f_head <= 2'd0; f_count <= 3'd0; st_rdy <= 1'b0;
             s_v <= 1'b0; st <= ST_RUN; k <= 2'd0; second <= 1'b0; s_early <= 1'b0;
+            s_hv <= 1'b0;
         end
     end
 

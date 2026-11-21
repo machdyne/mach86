@@ -18,6 +18,24 @@ instruction at a time, before they reach a board.
 Lockstep is the method Zeitlos uses between its two CPU cores. Here
 the second party is the C model.
 
+The lockstep bench can make the memory behind the RTL core awkward,
+which nothing may change but the time: `M86B_WAIT=n` answers reads up
+to n cycles late (and reports a read that leaves the bus unanswered,
+which the SoC's cache cannot take), `M86B_STRDY=1` makes stores wait
+at random, `M86B_DMA=n` asks for a byte every n cycles, and for
+design C `M86C_ABORT=n` makes its pipeline give an instruction up one
+cycle in n. Design C's two faults of round 37 ([cpu_c.md](cpu_c.md))
+were of kinds the bench could not show before the first and last of
+these.
+
+The RTL floating-point unit is compared with the model's in the same
+lockstep, its registers and status after every instruction
+(`make check-fpu-rtl`, [fpu.md](fpu.md)).
+
+The model's floating-point unit has a check of its own kind: its
+arithmetic is compared, bit for bit, with the x87 of the machine the
+tests run on (`make check-fpu`, [fpu.md](fpu.md)).
+
 Layers 1, 3 and 5 run on the RTL core today ([cpu.md](cpu.md#verification)).
 Layer 2 is thin: the directed programs do not yet cover single-step,
 NMI or the system instructions. Layer 4 waits for the PC hardware in
@@ -95,14 +113,76 @@ LOCKSTEP_PROFILE=620000000 output/b/rtlpcb -bios output/bios/bios.bin \
   -run 620000000
 ```
 
-### Without the decoder's window
+For design B the table is followed by the same cycles sorted by
+cause (a load's first cycle, a shift's extra cycles, decoding,
+micro-operations from the ROM and so on: the classes add up to the
+run's cycles), the micro-operations by kind, and three estimates
+made from the run: design B with the next micro-operation begun
+under a load's second cycle, the same with one-cycle shifts, and a
+pipelined engine with and without a jump predictor (the bench keeps
+a predictor's tables beside the model and counts what it would get
+wrong). The core gives the bench what it needs in two wires,
+`prof_st` and `prof_uop`, that nothing in the design uses. Round
+38's decision was made with it ([cpu_b.md](cpu_b.md#round-38)).
 
-Lakritz builds the core without the decoder's window (`WIN = 0`).
-`make check-b-nowin`, part of `make check`, boots the BIOS test on
-that core in lockstep, and `make check-nobram` runs the SoC as
-Lakritz builds it, without the window too. The DOS test, the
-protected-mode and paging tests and the 486 test were run on it by
-hand (`output/b/rtlpcb0` in place of `rtlpcb`).
+The profile also carries a model of the data cache in front of the
+main memory, in five sizes and one of two ways, fed with every
+access the core makes to main memory, and says how often each would
+miss and how often the line it puts out had been written
+([soc.md](soc.md#the-main-memory) has round 40's figures); and of the
+instruction cache with other ways of choosing an entry.
+
+`LOCKSTEP_TRACE=n` prints a line for every clock cycle from step n
+on (the interrupt line, the cycle's class, both instruction
+pointers, the bus): for finding out what the core was doing when a
+long run stops at a difference.
+
+**Two instructions in one cycle.** Since round 39 design B can end
+a load and the instruction after it in the same clock cycle
+([cpu_b.md](cpu_b.md#round-39)), and the bench cannot look between
+them. The core says so (`step_two`); the bench then runs the model
+two steps and compares after the second. An interrupt cannot come
+between the two in the core, so the bench holds the model's off for
+that one step; it does the same when the instruction after a load
+has begun beside it without ending (or its decoding has), since the
+core will finish that instruction before it takes an interrupt. The
+instruction pointer compared is the one the pending load left
+behind. DOOM found both cases, 43 and 125 million instructions in:
+neither was a fault in the core.
+
+### The core's options
+
+The core has three build options ([cpu_b.md](cpu_b.md#round-40)), and
+each side of each is run in lockstep:
+
+- `make check-b-boot` and the rest: all on, as Sergei builds it.
+- `make check-b-lak`: without paging, virtual 8086 mode and the I/O
+  permission bitmap (`VMEM = 0`), as Lakritz builds it
+  (`output/b/rtlpcbl`): the BIOS boot test, the 486 test and the two
+  protected-mode tests that need none of the three. DOOM was run on
+  it by hand, with the profile's command above.
+- `make check-b-nowin`: without the decoder's window and without the
+  load that lets the next instruction start (`WIN = 0`, `OVL = 0`:
+  `output/b/rtlpcb0`), the BIOS boot test.
+- `make check-nobram` runs the SoC as Lakritz builds it.
+
+All three are part of `make check`.
+
+### Design C
+
+Design C's core ([cpu_c.md](cpu_c.md)) has design B's ports and is
+checked by the same benches: `make -C sim check-c-boot` (the BIOS
+test in lockstep; `output/b/rtlpcc` is the bench, used like
+`rtlpcb`) and `make -C sim vectors-c VECTORS=...`. `CPARAM=-GPH=4`
+builds it with four clock cycles for each of design B's, one more
+than it needs: a difference from the model that goes away with it
+means a path passes too many cut registers. `make fmax-c` places and
+routes the core alone and prints its clock (`FMAX_MHZ`, `FMAX_PH`).
+
+The bench says how many instructions went through design C's
+pipeline, and with `LOCKSTEP_PROFILE=1` which opcodes did not, most
+frequent first: the list of what to teach the pipeline next.
+`CPARAM=-GFAST=0` builds the core without the pipeline.
 
 ### Requests from outside
 

@@ -1,3 +1,6 @@
+# The floating-point unit's part of the model's processor (docs/fpu.md).
+FPUSRC = m86fpu.c m86fpu.h m86fconst.h m86x87.h
+
 # Mach86 reference model. See docs/model.md.
 CC      ?= cc
 CFLAGS  ?= -O2 -g -std=gnu11 -Wall -Wextra
@@ -14,15 +17,15 @@ RTLOUT  = ../output/rtl
 
 all: $(OUT)/vectest $(OUT)/m86run $(OUT)/m86pc $(BIOS)
 
-$(OUT)/vectest: vectest.c vectest_model.c vectest.h m86cpu.c m86.h
+$(OUT)/vectest: vectest.c vectest_model.c vectest.h m86cpu.c m86.h m86pipe.h $(FPUSRC)
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -o $@ vectest.c vectest_model.c m86cpu.c
 
-$(OUT)/m86run: m86run.c m86cpu.c m86.h
+$(OUT)/m86run: m86run.c m86cpu.c m86.h m86pipe.h $(FPUSRC)
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -o $@ m86run.c m86cpu.c
 
-$(OUT)/m86pc: m86pc.c pc.c vga.c sdcard.c m86cpu.c pc.h vga.h m86.h
+$(OUT)/m86pc: m86pc.c pc.c vga.c sdcard.c m86cpu.c pc.h vga.h m86.h m86pipe.h $(FPUSRC)
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -o $@ m86pc.c pc.c vga.c sdcard.c m86cpu.c
 
@@ -91,7 +94,7 @@ $(RTLOUT)/rtlvec: $(RTL) vectest.c vectest_rtl.cpp vectest.h
 	  $(RTL) $(CURDIR)/$(RTLOUT)/vectest.o $(CURDIR)/vectest_rtl.cpp
 
 # The whole machine with the RTL core, in lockstep with the model.
-$(RTLOUT)/rtlpc: $(RTL) m86pc.c pc.c vga.c sdcard.c m86cpu.c lockstep.cpp pc.h vga.h m86.h
+$(RTLOUT)/rtlpc: $(RTL) m86pc.c pc.c vga.c sdcard.c m86cpu.c lockstep.cpp pc.h vga.h m86.h m86pipe.h $(FPUSRC)
 	@mkdir -p $(RTLOUT)
 	$(CC) $(CFLAGS) -DLOCKSTEP -c -o $(RTLOUT)/m86pc.o m86pc.c
 	$(CC) $(CFLAGS) -c -o $(RTLOUT)/pc.o pc.c
@@ -130,7 +133,7 @@ $(BOUT)/rtlvecb: $(RTLB) $(BOUT)/ucode.hex vectest.c vectest_rtlb.cpp vectest.h
 # The whole machine with design B, in lockstep with the model.
 # BPARAM: parameters of the core to try, as -GDC_AW=11.
 BPARAM ?=
-$(BOUT)/rtlpcb: $(RTLB) $(BOUT)/ucode.hex m86pc.c pc.c vga.c sdcard.c m86cpu.c lockstep.cpp pc.h vga.h m86.h
+$(BOUT)/rtlpcb: $(RTLB) $(BOUT)/ucode.hex m86pc.c pc.c vga.c sdcard.c m86cpu.c lockstep.cpp pc.h vga.h m86.h m86pipe.h $(FPUSRC)
 	$(CC) $(CFLAGS) -DLOCKSTEP -c -o $(BOUT)/m86pc.o m86pc.c
 	$(CC) $(CFLAGS) -c -o $(BOUT)/pc.o pc.c
 	$(CC) $(CFLAGS) -c -o $(BOUT)/vga.o vga.c
@@ -146,15 +149,102 @@ $(BOUT)/rtlpcb: $(RTLB) $(BOUT)/ucode.hex m86pc.c pc.c vga.c sdcard.c m86cpu.c l
 	  $(CURDIR)/$(BOUT)/sdcard.o $(CURDIR)/$(BOUT)/m86cpu.o \
 	  $(CURDIR)/lockstep.cpp
 
-# The same core without the decoder's window (WIN = 0), as Lakritz
-# builds it.
+# Design C (docs/cpu_c.md) in lockstep with the model: the same bench.
+# CPARAM passes parameters (CPARAM=-GPH=4).
+RTLC = ../rtl/cpu/m86_alu.v ../rtl/cpu/m86c_core.v
+$(BOUT)/rtlpcc: $(RTLC) $(BOUT)/rtlpcb
+	@rm -f $(BOUT)/rtlpcc
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86c_core $(VDEF) $(CPARAM) \
+	  -GUCODE='"$(CURDIR)/$(BOUT)/ucode.hex"' -GATTR='"$(CURDIR)/$(BOUT)/attr.hex"' \
+	  -Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-BLKSEQ -Wno-UNUSED \
+	  -Wno-CASEOVERLAP -Wno-UNOPTFLAT -Wno-LATCH -Wno-MULTIDRIVEN \
+	  -CFLAGS "-O2 -DCORE_B -DCORE_C -I$(CURDIR)" --Mdir $(BOUT)/obj_pcc -o ../rtlpcc \
+	  $(RTLC) $(CURDIR)/$(BOUT)/m86pc.o $(CURDIR)/$(BOUT)/pc.o $(CURDIR)/$(BOUT)/vga.o \
+	  $(CURDIR)/$(BOUT)/sdcard.o $(CURDIR)/$(BOUT)/m86cpu.o \
+	  $(CURDIR)/lockstep.cpp
+
+# Design C with its floating-point unit (docs/fpu.md), in lockstep with
+# the model's: m86pc's -fpu goes first on its command line.
+RTLCF = $(RTLC) ../rtl/cpu/m86_fpu.v ../rtl/cpu/m86_fparith.v
+$(BOUT)/rtlpccf: $(RTLCF) $(BOUT)/rtlpcb ../sw/ucode/m86b_ucode.py lockstep.cpp
+	@rm -f $(BOUT)/rtlpccf
+	@mkdir -p $(BOUT)f
+	python3 ../sw/ucode/m86b_ucode.py $(BOUT)f fpu > /dev/null
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86c_core $(VDEF) $(CPARAM) -GFPU=1 \
+	  -GUCODE='"$(CURDIR)/$(BOUT)f/ucode.hex"' -GATTR='"$(CURDIR)/$(BOUT)f/attr.hex"' \
+	  -Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-BLKSEQ -Wno-UNUSED \
+	  -Wno-CASEOVERLAP -Wno-UNOPTFLAT -Wno-LATCH -Wno-MULTIDRIVEN \
+	  -CFLAGS "-O2 -DCORE_B -DCORE_C -DCORE_FPU -I$(CURDIR)" --Mdir $(BOUT)/obj_pccf -o ../rtlpccf \
+	  $(RTLCF) $(CURDIR)/$(BOUT)/m86pc.o $(CURDIR)/$(BOUT)/pc.o $(CURDIR)/$(BOUT)/vga.o \
+	  $(CURDIR)/$(BOUT)/sdcard.o $(CURDIR)/$(BOUT)/m86cpu.o \
+	  $(CURDIR)/lockstep.cpp
+
+
+# The FPU in RTL (docs/fpu.md). Its arithmetic alone against the
+# model's, operation by operation; then design C with it in lockstep
+# with the model on the FPU's test program (as much of it as needs no
+# interrupt 13) and on instructions at random, the second also with late
+# memory and with the pipeline giving instructions up; then the whole
+# test program, interrupt 13 and all, on the SoC.
+FPUOUT = ../output/fpu
+$(FPUOUT)/fparith_tb: ../rtl/cpu/m86_fparith.v fparith_tb.cpp $(FPUSRC)
+	@mkdir -p $(FPUOUT)
+	$(CC) -O2 -c -o $(FPUOUT)/m86fpu.o m86fpu.c
+	@rm -f $(FPUOUT)/fparith_tb
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86_fparith \
+	  -Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-BLKSEQ -Wno-UNUSED -Wno-UNOPTFLAT \
+	  -CFLAGS "-O2 -I$(CURDIR)" --Mdir $(FPUOUT)/obj -o ../fparith_tb \
+	  ../rtl/cpu/m86_fparith.v $(CURDIR)/fparith_tb.cpp $(CURDIR)/$(FPUOUT)/m86fpu.o
+
+../tests/prog/fpu1test.asm: ../tests/prog/fputest.asm ../tools/mkfpu1test.py
+	python3 ../tools/mkfpu1test.py ../tests/prog/fputest.asm > $@
+
+check-fpu-rtl: all $(FPUOUT)/fparith_tb $(BOUT)/rtlpccf ../output/soc/soc_tb_cf \
+               $(OUT)/fpu1test.bin $(OUT)/fpurand.bin $(OUT)/fputest.bin
+	$(FPUOUT)/fparith_tb 100000 | tail -1
+	cp $(OUT)/fpu1test.bin $(SOCOUT)/fpu1test.img
+	$(BOUT)/rtlpccf -fpu -bios $(BIOS) -disk $(SOCOUT)/fpu1test.img -max 50000000 \
+	  -expect "fpu test passed"
+	cp $(OUT)/fpurand.bin $(SOCOUT)/fpurand.img
+	$(BOUT)/rtlpccf -fpu -bios $(BIOS) -disk $(SOCOUT)/fpurand.img -max 80000000 \
+	  -expect "fpu random test done"
+	M86B_WAIT=3 M86B_STRDY=1 M86C_ABORT=200 \
+	$(BOUT)/rtlpccf -fpu -bios $(BIOS) -disk $(SOCOUT)/fpurand.img -max 80000000 \
+	  -expect "fpu random test done"
+	cp $(OUT)/fputest.bin $(SOCOUT)/fputest_cf.img
+	$(SOCOUT)/soc_tb_cf -quiet -disk $(SOCOUT)/fputest_cf.img -max 200000000 \
+	  -expect "fpu test passed"
+	@echo "fpu: the RTL floating-point unit agrees with the model, alone, in design C and on the SoC"
+
+check-c-boot: all $(BOUT)/rtlpcc $(OUT)/boottest.bin
+	cp $(OUT)/boottest.bin $(OUT)/boottest.img
+	$(BOUT)/rtlpcc -bios $(BIOS) -disk $(OUT)/boottest.img -max 200000000 \
+	  -expect "type something" -type "hello\r" -expect "boot test passed"
+	@echo "design C: BIOS boot test passes in lockstep with the model"
+
+# The same core with its options off: without the decoder's window
+# (WIN = 0) and without the load that lets the next instruction start
+# (OVL = 0).
 $(BOUT)/rtlpcb0: $(BOUT)/rtlpcb
 	@rm -f $(BOUT)/rtlpcb0
-	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86b_core $(VDEF) -GWIN=0 \
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86b_core $(VDEF) -GWIN=0 -GOVL=0 \
 	  -GUCODE='"$(CURDIR)/$(BOUT)/ucode.hex"' -GATTR='"$(CURDIR)/$(BOUT)/attr.hex"' \
 	  -Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-BLKSEQ -Wno-UNUSED \
 	  -Wno-CASEOVERLAP -Wno-UNOPTFLAT -Wno-LATCH -Wno-MULTIDRIVEN \
 	  -CFLAGS "-O2 -DCORE_B -I$(CURDIR)" --Mdir $(BOUT)/obj_pc0 -o ../rtlpcb0 \
+	  $(RTLB) $(CURDIR)/$(BOUT)/m86pc.o $(CURDIR)/$(BOUT)/pc.o $(CURDIR)/$(BOUT)/vga.o \
+	  $(CURDIR)/$(BOUT)/sdcard.o $(CURDIR)/$(BOUT)/m86cpu.o \
+	  $(CURDIR)/lockstep.cpp
+
+# The core as Lakritz builds it: without paging, virtual 8086 mode and
+# the I/O permission bitmap (VMEM = 0).
+$(BOUT)/rtlpcbl: $(BOUT)/rtlpcb
+	@rm -f $(BOUT)/rtlpcbl
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86b_core $(VDEF) -GVMEM=0 \
+	  -GUCODE='"$(CURDIR)/$(BOUT)/ucode.hex"' -GATTR='"$(CURDIR)/$(BOUT)/attr.hex"' \
+	  -Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-BLKSEQ -Wno-UNUSED \
+	  -Wno-CASEOVERLAP -Wno-UNOPTFLAT -Wno-LATCH -Wno-MULTIDRIVEN \
+	  -CFLAGS "-O2 -DCORE_B -I$(CURDIR)" --Mdir $(BOUT)/obj_pcl -o ../rtlpcbl \
 	  $(RTLB) $(CURDIR)/$(BOUT)/m86pc.o $(CURDIR)/$(BOUT)/pc.o $(CURDIR)/$(BOUT)/vga.o \
 	  $(CURDIR)/$(BOUT)/sdcard.o $(CURDIR)/$(BOUT)/m86cpu.o \
 	  $(CURDIR)/lockstep.cpp
@@ -164,6 +254,20 @@ check-b-nowin: all $(BOUT)/rtlpcb0 $(OUT)/boottest.bin
 	$(BOUT)/rtlpcb0 -bios $(BIOS) -disk $(OUT)/boottest.img -max 200000000 \
 	  -expect "type something" -type "hello\r" -expect "boot test passed"
 	@echo "design B without the decoder's window: BIOS boot test passes in lockstep with the model"
+
+# Lakritz's core: the boot test, the 486's instructions and protected
+# mode as far as privilege levels, in lockstep with the model.
+check-b-lak: all $(BOUT)/rtlpcbl $(OUT)/boottest.bin $(OUT)/i486test.bin $(OUT)/pmtest.bin $(OUT)/pm2test.bin
+	cp $(OUT)/boottest.bin $(OUT)/boottest.img
+	$(BOUT)/rtlpcbl -bios $(BIOS) -disk $(OUT)/boottest.img -max 200000000 \
+	  -expect "type something" -type "hello\r" -expect "boot test passed"
+	cp $(OUT)/i486test.bin $(SOCOUT)/i486test_l.img
+	$(BOUT)/rtlpcbl -bios $(BIOS) -disk $(SOCOUT)/i486test_l.img -max 200000000 -expect "486 test passed"
+	cp $(OUT)/pmtest.bin $(SOCOUT)/pmtest_l.img
+	$(BOUT)/rtlpcbl -bios $(BIOS) -disk $(SOCOUT)/pmtest_l.img -max 200000000 -expect "pm test passed"
+	cp $(OUT)/pm2test.bin $(SOCOUT)/pm2test_l.img
+	$(BOUT)/rtlpcbl -bios $(BIOS) -disk $(SOCOUT)/pm2test_l.img -max 200000000 -expect "pm2 test passed"
+	@echo "design B as Lakritz builds it: boot, 486 and protected-mode tests pass in lockstep with the model"
 
 # Design B boots the BIOS test in lockstep with the model.
 check-b-boot: all $(BOUT)/rtlpcb $(OUT)/boottest.bin
@@ -198,7 +302,7 @@ SESSION = -expect "new date" -type "\r" -expect "new time" -type "\r" \
 # The SoC as it goes on a board, seen through its serial console and
 # SD card pins (soc_tb.cpp).
 SOCOUT = ../output/soc
-RTLSOC = $(wildcard ../rtl/soc/*.v) $(RTLB)
+RTLSOC = $(wildcard ../rtl/soc/*.v) $(RTLB) ../rtl/cpu/m86c_core.v ../rtl/cpu/m86_fpu.v ../rtl/cpu/m86_fparith.v
 $(SOCOUT)/soc_tb: $(RTLSOC) $(BIOS) soc_tb.cpp sdcard.c pc.h ../sw/ucode/m86b_ucode.py ../tools/lanes.py ../tools/mkfont.py
 	@mkdir -p $(SOCOUT)
 	python3 ../sw/ucode/m86b_ucode.py $(SOCOUT) > /dev/null
@@ -342,6 +446,20 @@ check-486: all $(BOUT)/rtlpcb $(OUT)/i486test.bin
 	  -expect "486 test passed"
 	@echo "486: the double shifts, bit instructions and 486 instructions pass on the model and in lockstep"
 
+# The floating-point unit (docs/fpu.md): its arithmetic against the x87
+# of the machine this runs on (an x86: elsewhere that part is skipped),
+# and its instructions by a test program on the model.
+$(OUT)/fputest: fputest.c $(FPUSRC)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -o $@ fputest.c m86fpu.c -lm
+
+check-fpu: all $(OUT)/fputest $(OUT)/fputest.bin
+	$(OUT)/fputest 300000 | tail -1
+	cp $(OUT)/fputest.bin $(SOCOUT)/fputest.img
+	$(OUT)/m86pc -fpu -bios $(BIOS) -disk $(SOCOUT)/fputest.img -max 50000000 \
+	  -dexpect "fpu test passed" > /dev/null
+	@echo "fpu: the model's floating-point unit agrees with this machine's and passes its test program"
+
 # Sound: the PC speaker's bit on the SoC is the tone the program asked
 # for, is silent when it should be, and the BIOS's bell rings and ends
 # (also on the model, where only its ending can be seen).
@@ -408,6 +526,44 @@ $(SOCOUT)/soc_tb_main: $(RTLSOC) $(BIOS) soc_tb.cpp sdcard.c pc.h ../sw/ucode/m8
 	  -CFLAGS "-O2 -DSOC_RTL -I$(CURDIR)" --Mdir $(SOCOUT)/obj_main -o ../soc_tb_main \
 	  $(RTLSOC) $(CURDIR)/$(SOCOUT)/sdcard.o $(CURDIR)/soc_tb.cpp
 
+# And with design C for a processor (CPU_C = 1).
+$(SOCOUT)/soc_tb_c: $(RTLSOC) $(BIOS) soc_tb.cpp sdcard.c pc.h ../sw/ucode/m86b_ucode.py ../tools/lanes.py ../tools/mkfont.py
+	@mkdir -p $(SOCOUT)
+	python3 ../sw/ucode/m86b_ucode.py $(SOCOUT) > /dev/null
+	python3 ../tools/lanes.py $(BIOS) $(SOCOUT)/rom 0x4000 16
+	python3 ../tools/mkfont.py ../sw/font/font16.mem $(SOCOUT)/font.hex
+	$(CC) $(CFLAGS) -c -o $(SOCOUT)/sdcard.o sdcard.c
+	@rm -f $(SOCOUT)/soc_tb_c
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86_soc $(VDEF) -GCPU_C=1 -GMAIN_MEM=1 -GEXT_KB=15360 -GVGA_EXT=1 \
+	  -GUCODE='"$(CURDIR)/$(SOCOUT)/ucode.hex"' -GATTR='"$(CURDIR)/$(SOCOUT)/attr.hex"' \
+	  -GROM0='"$(CURDIR)/$(SOCOUT)/rom0.hex"' -GROM1='"$(CURDIR)/$(SOCOUT)/rom1.hex"' \
+	  -GROM2='"$(CURDIR)/$(SOCOUT)/rom2.hex"' -GROM3='"$(CURDIR)/$(SOCOUT)/rom3.hex"' \
+	  -GFONT='"$(CURDIR)/$(SOCOUT)/font.hex"' \
+	  -Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-BLKSEQ -Wno-UNUSED \
+	  -Wno-CASEOVERLAP -Wno-UNOPTFLAT -Wno-LATCH -Wno-MULTIDRIVEN -Wno-PINMISSING \
+	  -CFLAGS "-O2 -DSOC_RTL -I$(CURDIR)" --Mdir $(SOCOUT)/obj_c -o ../soc_tb_c \
+	  $(RTLSOC) $(CURDIR)/$(SOCOUT)/sdcard.o $(CURDIR)/soc_tb.cpp
+
+# ... and its floating-point unit (CPU_FPU = 1), with the microcode for it.
+$(SOCOUT)/soc_tb_cf: $(RTLSOC) $(BIOS) soc_tb.cpp sdcard.c pc.h ../sw/ucode/m86b_ucode.py ../tools/lanes.py ../tools/mkfont.py
+	@mkdir -p $(SOCOUT)
+	python3 ../sw/ucode/m86b_ucode.py $(SOCOUT) > /dev/null
+	@mkdir -p $(SOCOUT)f
+	python3 ../sw/ucode/m86b_ucode.py $(SOCOUT)f fpu > /dev/null
+	python3 ../tools/lanes.py $(BIOS) $(SOCOUT)/rom 0x4000 16
+	python3 ../tools/mkfont.py ../sw/font/font16.mem $(SOCOUT)/font.hex
+	$(CC) $(CFLAGS) -c -o $(SOCOUT)/sdcard.o sdcard.c
+	@rm -f $(SOCOUT)/soc_tb_cf
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86_soc $(VDEF) -GCPU_C=1 -GCPU_FPU=1 -GMAIN_MEM=1 -GEXT_KB=15360 -GVGA_EXT=1 \
+	  -GUCODE='"$(CURDIR)/$(SOCOUT)f/ucode.hex"' -GATTR='"$(CURDIR)/$(SOCOUT)f/attr.hex"' \
+	  -GROM0='"$(CURDIR)/$(SOCOUT)/rom0.hex"' -GROM1='"$(CURDIR)/$(SOCOUT)/rom1.hex"' \
+	  -GROM2='"$(CURDIR)/$(SOCOUT)/rom2.hex"' -GROM3='"$(CURDIR)/$(SOCOUT)/rom3.hex"' \
+	  -GFONT='"$(CURDIR)/$(SOCOUT)/font.hex"' \
+	  -Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-BLKSEQ -Wno-UNUSED \
+	  -Wno-CASEOVERLAP -Wno-UNOPTFLAT -Wno-LATCH -Wno-MULTIDRIVEN -Wno-PINMISSING \
+	  -CFLAGS "-O2 -DSOC_RTL -I$(CURDIR)" --Mdir $(SOCOUT)/obj_cf -o ../soc_tb_cf \
+	  $(RTLSOC) $(CURDIR)/$(SOCOUT)/sdcard.o $(CURDIR)/soc_tb.cpp
+
 # And with no video memory in block RAM at all (VGA_BRAM = 0), as a
 # board without the blocks builds it: Lakritz.
 $(SOCOUT)/soc_tb_nobram: $(RTLSOC) $(BIOS) soc_tb.cpp sdcard.c pc.h ../sw/ucode/m86b_ucode.py ../tools/lanes.py ../tools/mkfont.py
@@ -417,7 +573,7 @@ $(SOCOUT)/soc_tb_nobram: $(RTLSOC) $(BIOS) soc_tb.cpp sdcard.c pc.h ../sw/ucode/
 	python3 ../tools/mkfont.py ../sw/font/font16.mem $(SOCOUT)/font.hex
 	$(CC) $(CFLAGS) -c -o $(SOCOUT)/sdcard.o sdcard.c
 	@rm -f $(SOCOUT)/soc_tb_nobram
-	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86_soc -GMAIN_MEM=1 -GEXT_KB=15360 -GVGA_EXT=1 -GVGA_BRAM=0 -GCPU_WIN=0 \
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86_soc -GMAIN_MEM=1 -GEXT_KB=15360 -GVGA_EXT=1 -GVGA_BRAM=0 -GCPU_VMEM=0 \
 	  -GUCODE='"$(CURDIR)/$(SOCOUT)/ucode.hex"' -GATTR='"$(CURDIR)/$(SOCOUT)/attr.hex"' \
 	  -GROM0='"$(CURDIR)/$(SOCOUT)/rom0.hex"' -GROM1='"$(CURDIR)/$(SOCOUT)/rom1.hex"' \
 	  -GROM2='"$(CURDIR)/$(SOCOUT)/rom2.hex"' -GROM3='"$(CURDIR)/$(SOCOUT)/rom3.hex"' \
@@ -457,10 +613,15 @@ check-tb:
 	vvp -n $(SOCOUT)/dcache_tb | tee $(SOCOUT)/dcache_tb.log | tail -n 2
 	grep -q "dcache: pass" $(SOCOUT)/dcache_tb.log
 	iverilog -g2005 -o $(SOCOUT)/ddr3_tb m86_ddr3_tb.v ddr3_phy_ecp5_sim.v \
-	  ../rtl/soc/m86_dcache.v ../rtl/soc/m86_xclk.v $(ZL)/ddr3.v \
+	  ../rtl/soc/m86_dcache.v ../rtl/soc/m86_xclk.v ../rtl/soc/m86_xline.v $(ZL)/ddr3.v \
 	  $(ZL)/ddr3_ctrl.v $(ZL)/ddr3_phy_sim.v $(ZL)/ddr3_model.v
 	vvp -n $(SOCOUT)/ddr3_tb | tee $(SOCOUT)/ddr3_tb.log | tail -n 2
 	grep -q "ddr3: pass" $(SOCOUT)/ddr3_tb.log
+	iverilog -g2005 -DWCOMBINE=1 -o $(SOCOUT)/ddr3_tbw m86_ddr3_tb.v ddr3_phy_ecp5_sim.v \
+	  ../rtl/soc/m86_dcache.v ../rtl/soc/m86_xclk.v ../rtl/soc/m86_xline.v $(ZL)/ddr3.v \
+	  $(ZL)/ddr3_ctrl.v $(ZL)/ddr3_phy_sim.v $(ZL)/ddr3_model.v
+	vvp -n $(SOCOUT)/ddr3_tbw | tee $(SOCOUT)/ddr3_tbw.log | tail -n 2
+	grep -q "ddr3: pass" $(SOCOUT)/ddr3_tbw.log
 	iverilog -g2005 -o $(SOCOUT)/usbkbd_tb m86_usbkbd_tb.v ../rtl/soc/m86_usbkbd.v
 	vvp -n $(SOCOUT)/usbkbd_tb | tee $(SOCOUT)/usbkbd_tb.log | tail -n 2
 	grep -q "usbkbd: pass" $(SOCOUT)/usbkbd_tb.log
@@ -519,6 +680,17 @@ check-soc-main: all $(SOCOUT)/soc_tb_main $(OUT)/boottest.bin sdcard
 	$(SOCOUT)/soc_tb_main -quiet -disk $(SOCOUT)/session_main.img -max 6000000000 \
 	  $(SESSION)
 	@echo "soc: BIOS boot test and DOS pass with the main memory behind the cache"
+
+# The same machine with design C.
+check-soc-c: all $(SOCOUT)/soc_tb_c $(OUT)/boottest.bin sdcard
+	cp $(OUT)/boottest.bin $(SOCOUT)/boottest_c.img
+	$(SOCOUT)/soc_tb_c -quiet -disk $(SOCOUT)/boottest_c.img -max 1200000000 \
+	  -expect "640 KB memory" \
+	  -expect "type something" -type "hello\r" -expect "boot test passed"
+	cp $(SDIMG) $(SOCOUT)/session_c.img
+	$(SOCOUT)/soc_tb_c -quiet -disk $(SOCOUT)/session_c.img -max 18000000000 \
+	  $(SESSION)
+	@echo "soc: BIOS boot test and DOS pass with design C"
 
 # The BIOS trains the memory (against the test bench's stand-in), finds
 # the one right setting, and then boots as usual.
@@ -709,6 +881,24 @@ check-card: card
 	  -expect 'C:\>'
 	@echo "card: DOS reads the FAT32 partition and a CD image on it"
 
+# The same vectors on design C.
+$(BOUT)/rtlvecc: $(RTLC) $(BOUT)/rtlvecb
+	@rm -f $(BOUT)/rtlvecc
+	verilator --language 1364-2005 --cc --exe --build -j 2 -O3 --top-module m86c_core $(CPARAM) \
+	  -GUCODE='"$(CURDIR)/$(BOUT)/ucode.hex"' -GATTR='"$(CURDIR)/$(BOUT)/attr.hex"' \
+	  -Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-BLKSEQ -Wno-UNUSED \
+	  -Wno-CASEOVERLAP -Wno-UNOPTFLAT -Wno-LATCH -Wno-MULTIDRIVEN \
+	  -CFLAGS "-O2 -DCORE_C -I$(CURDIR)" --Mdir $(BOUT)/obj_vc -o ../rtlvecc \
+	  $(RTLC) $(CURDIR)/$(BOUT)/vectest.o $(CURDIR)/vectest_rtlb.cpp
+
+vectors-c: $(BOUT)/rtlvecc
+	@test -d $(VECTORS)/v1_ex_real_mode || \
+	  { echo "no vectors in $(VECTORS): run tools/fetch_vectors.sh"; exit 1; }
+	cd $(VECTORS)/v1_ex_real_mode && $(CURDIR)/$(BOUT)/rtlvecc -n 5 \
+	  -r ../revocation_list.txt -c ../80386.csv -k $(CURDIR)/$(KNOWN_B) \
+	  `python3 $(CURDIR)/../tools/m86b_vecfiles.py $(CURDIR)/$(BOUT)/attr.hex .` \
+	  | tail -n 1
+
 vectors-b: $(BOUT)/rtlvecb
 	@test -d $(VECTORS)/v1_ex_real_mode || \
 	  { echo "no vectors in $(VECTORS): run tools/fetch_vectors.sh"; exit 1; }
@@ -815,4 +1005,4 @@ rtl-dos: all $(RTLOUT)/rtlpc $(OUT)/dostest.com
 clean:
 	rm -rf $(OUT) $(RTLOUT) $(BOUT)
 
-.PHONY: all check check-b-nowin rtl-check profile vectors rtl-vectors vectors-b check-b-boot dos-b check-tb check-soc check-soc-main check-soc-train check-card check-pm check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse card soc-dos check-gate gate-dos sdcard dos rtl-dos clean
+.PHONY: all check check-b-lak check-fpu check-fpu-rtl check-soc-c check-c-boot vectors-c check-b-nowin rtl-check profile vectors rtl-vectors vectors-b check-b-boot dos-b check-tb check-soc check-soc-main check-soc-train check-card check-pm check-gfx check-gfx2 check-nobram check-spk check-opl check-mouse card soc-dos check-gate gate-dos sdcard dos rtl-dos clean

@@ -13,6 +13,10 @@ word; `at(...)` says which opcodes start there.
 import sys
 
 # Registers.
+# With a second argument "fpu" the microcode is for a core with the
+# floating-point unit (design C with FPU = 1): the escapes D8 to DF.
+FPU = len(sys.argv) > 2 and sys.argv[2] == 'fpu'
+
 EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI = range(8)
 ZERO, T1, T2, T3, T4, T5, T6, T7 = range(8, 16)
 ES, CS, SS, DS, FS, GS, FLAT, IO = range(8)
@@ -50,6 +54,11 @@ def UNPC(n):
 # and outside the I/O privilege level; on the way out of it; at level
 # 0; in protected mode proper (PE set and not virtual 8086 mode).
 X_VM, X_VMS, X_VMINT, X_CPL0, X_PM = range(5)
+# ... and of the floating-point unit (rtl/cpu/m86_fpu.v): it has another
+# part of the operand to be given or to give; that part is 16 bits.
+X_FMORE, X_F16 = 5, 6
+# ... the instruction is to be an exception instead: 7, or (X_F16) 16.
+X_FTRAP = 7
 
 
 def UPX(n):
@@ -256,7 +265,7 @@ label('reset')
 # hardware.)
 for r in (EAX, ECX, EBX, ESP, EBP, ESI, EDI):
     u(unit=ALU, aop=OR, a=ZERO, b=ZERO, d=r)
-u(unit=ALUI, aop=OR, a=ZERO, d=EDX, usek=1, k=0x108)    # 0420h (a 486SX), in three steps
+u(unit=ALUI, aop=OR, a=ZERO, d=EDX, usek=1, k=0x10C if FPU else 0x108)  # 0420h (a 486SX) or 0430h (a DX), in three steps
 u(unit=ALU, aop=ADD, a=EDX, b=EDX, d=EDX)
 u(unit=ALU, aop=ADD, a=EDX, b=EDX, d=EDX)
 for seg in (ES, SS, DS, FS, GS):
@@ -383,8 +392,8 @@ at([0xE8], imm=I_Z, rel=1)                              # CALL near
 u(unit=STORE, a=ESP, aop=ST_READ, b=R_NEXT, seg=SS, a16=1, aupd=1,
   size=ISIZE, br=2, end=1)
 at([0xC3])                                              # RET near
-u(unit=LOAD, a=ESP, seg=SS, a16=1, aupd=1, d=T1, size=ISIZE)
-u(unit=SPEC, aop=NOP, c=T1, size=ISIZE, br=7, cc=J_REG, end=1)
+# One step: the load of the return address is the jump (br 3).
+u(unit=LOAD, a=ESP, seg=SS, a16=1, aupd=1, size=ISIZE, br=3, end=1)
 
 # ---------------------------------------------------------------------
 # Small things
@@ -1167,10 +1176,79 @@ for op, adj in [(0x37, ADD), (0x3F, SUB)]:              # AAA, AAS
 at([0xD6], byte=1)                                      # SALC: AL = carry ? FFh : 0
 u(unit=ALU, aop=SBB, a=EAX, b=EAX, d=EAX, size=0, end=1)
 
-at([0x9B])                                              # WAIT: nothing to wait for
-u(unit=SPEC, aop=NOP, end=1)
-at(range(0xD8, 0xE0), modrm=1)                          # coprocessor: there is none
-u(unit=SPEC, aop=NOP, end=1)
+at([0x9B])                                              # WAIT
+if not FPU:
+    u(unit=SPEC, aop=NOP, end=1)                        # (nothing to wait for)
+else:
+    u(unit=SPEC, aop=NOP)
+    u(unit=SPEC, aop=NOP, cc=11, b=5)                   # (the unit looks: F_WAIT)
+    u(unit=SPEC, aop=NOP)
+    u(unit=SPEC, aop=NOP, jmp='fp_trap', ucc=UPX(X_FTRAP))
+    u(unit=SPEC, aop=NOP, end=1)
+if not FPU:
+    at(range(0xD8, 0xE0), modrm=1)                      # coprocessor: there is none
+    u(unit=SPEC, aop=NOP, end=1)
+else:
+    # The floating-point unit (rtl/cpu/m86_fpu.v, docs/fpu.md) does the
+    # instruction; this does its memory accesses and tells it when. A
+    # command is a NOP with cc 11 and the command in B. The unit's
+    # conditions are looked at a micro-operation after the command that
+    # changes them, which is what the NOPs without a jump are for.
+    F_START, F_PUT, F_GET, F_RUN, F_COMMIT = range(5)
+
+    def fpu(cmd, **kw):
+        u(unit=SPEC, aop=NOP, cc=11, b=cmd, **kw)
+
+    at(range(0xD8, 0xE0), modrm=1, mem=True)
+    u(unit=SPEC, aop=LEA, ea=1, d=T5)
+    fpu(F_START, a=T5, selseg=SEG_EA)   # (the operand's offset; its segment is looked at too)
+    u(unit=SPEC, aop=NOP)
+    u(unit=SPEC, aop=NOP, jmp='fp_trap', ucc=UPX(X_FTRAP))
+    label('fp_rd')
+    u(unit=SPEC, aop=NOP, jmp='fp_run', ucc=UNPX(X_FMORE))
+    u(unit=SPEC, aop=NOP, jmp='fp_rd16', ucc=UPX(X_F16))
+    u(unit=LOAD, a=T5, selseg=SEG_EA, aupd=1, d=T1, size=2)
+    fpu(F_PUT, a=T1)
+    u(unit=SPEC, aop=NOP, jmp='fp_rd')
+    label('fp_rd16')
+    u(unit=LOAD, a=T5, selseg=SEG_EA, aupd=1, d=T1, size=1)
+    fpu(F_PUT, a=T1)
+    u(unit=SPEC, aop=NOP, jmp='fp_rd')
+    label('fp_run')
+    fpu(F_RUN)
+    u(unit=SPEC, aop=NOP)
+    label('fp_wr')
+    u(unit=SPEC, aop=NOP, jmp='fp_end', ucc=UNPX(X_FMORE))
+    u(unit=SPEC, aop=NOP, jmp='fp_wr16', ucc=UPX(X_F16))
+    fpu(F_GET, d=T1)
+    u(unit=STORE, a=T5, c=T1, selseg=SEG_EA, aupd=1, cc=UP, size=2)
+    u(unit=SPEC, aop=NOP, jmp='fp_wr')
+    label('fp_wr16')
+    fpu(F_GET, d=T1)
+    u(unit=STORE, a=T5, c=T1, selseg=SEG_EA, aupd=1, cc=UP, size=1)
+    u(unit=SPEC, aop=NOP, jmp='fp_wr')
+    label('fp_end')
+    fpu(F_COMMIT, end=1)
+
+    # CR0 says there is to be no FPU (exception 7), or an exception of
+    # its own is waiting (16).
+    label('fp_trap')
+    u(unit=SPEC, aop=NOP, jmp='fp_mf', ucc=UPX(X_F16))
+    u(unit=SPEC, aop=RAISE, usek=1, k=7, end=1)
+    label('fp_mf')
+    u(unit=SPEC, aop=RAISE, usek=1, k=16, end=1)
+
+    # The register forms: nothing in memory. EAX goes there and comes
+    # back, changed by FNSTSW AX alone.
+    at(range(0xD8, 0xE0), modrm=1, mem=False)
+    fpu(F_PUT, a=EAX)       # (first: what the instruction is, is not known to
+    fpu(F_START, a=ZERO)    # the unit in a cached instruction's first cycle)
+    u(unit=SPEC, aop=NOP)
+    u(unit=SPEC, aop=NOP, jmp='fp_trap', ucc=UPX(X_FTRAP))
+    fpu(F_RUN)
+    fpu(F_GET, d=T1)
+    u(unit=ALU, aop=OR, a=ZERO, b=T1, d=EAX, size=1)
+    fpu(F_COMMIT, end=1)
 
 at([0x90])                                              # NOP
 u(unit=SPEC, aop=NOP, end=1)

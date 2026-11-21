@@ -42,6 +42,23 @@
 `ifndef M86_TOP
 `define M86_TOP sergei_ml2
 `endif
+// The processor's options (rtl/cpu/m86b_core.v): paging, virtual 8086
+// mode and the I/O permission bitmap; loads that let the next
+// instruction start.
+`ifndef M86_VMEM
+`define M86_VMEM 1
+`endif
+`ifndef M86_OVL
+`define M86_OVL 1
+`endif
+// The main memory's bridge: 1 a cache line at a time (m86_xline.v), 0 a
+// word at a time (m86_xclk.v, as before round 40).
+`ifndef M86_XLINE
+`define M86_XLINE 1
+`endif
+`ifndef M86_WCOMBINE
+`define M86_WCOMBINE 0
+`endif
 module `M86_TOP (
     input  wire CLK_48,
     output wire LED_B,
@@ -181,15 +198,34 @@ module `M86_TOP (
     wire [31:0] xv_wdata, xv_rdata, lb_q;
     wire [7:0]  lb_addr;
     wire        m_req, m_we, m_ack, x_req, x_we, x_ack;
+    wire        m_raw;
     wire [23:0] m_addr;
     wire [1:0]  x_addr;
     wire [31:0] m_wdata, m_rdata, x_wdata, x_rdata;
+`ifdef M86_CPU_C
+    // Design C (docs/cpu_c.md). Its clock is 630 MHz / M86_C_DIV: 16
+    // gives 39.4 MHz, 13 gives 48.5. M86_C_PH is the core's PH. With
+    // M86_CPU_FPU the core has its floating-point unit (docs/fpu.md).
+`ifndef M86_C_DIV
+`define M86_C_DIV 16
+`endif
+`ifndef M86_C_PH
+`define M86_C_PH 3
+`endif
+`ifdef M86_CPU_FPU
+    m86_soc #(.CLK_HZ(630000000 / `M86_C_DIV), .CPU_C(1), .CPU_PH(`M86_C_PH), .CPU_FPU(1), .BAUD(1000000),
+`else
+    m86_soc #(.CLK_HZ(630000000 / `M86_C_DIV), .CPU_C(1), .CPU_PH(`M86_C_PH), .BAUD(1000000),
+`endif
+`else
     m86_soc #(.CLK_HZ(33157895), .BAUD(1000000),
+`endif
               .MAIN_MEM(1), .MEM_AW(26), .MEM_TRAIN(1),
-              .CACHE_LINE_BITS(11), .EXT_KB(64512), .VGA_EXT(1)) soc (
+              .CACHE_LINE_BITS(11), .EXT_KB(64512), .VGA_EXT(1),
+              .CPU_VMEM(`M86_VMEM), .CPU_OVL(`M86_OVL)) soc (
         .clk(clk), .rst(rst),
         .m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_wdata(m_wdata),
-        .m_rdata(m_rdata), .m_ack(m_ack),
+        .m_rdata(m_rdata), .m_ack(m_ack), .m_raw(m_raw),
         .x_req(x_req), .x_we(x_we), .x_addr(x_addr), .x_wdata(x_wdata),
         .x_rdata(x_rdata), .x_ack(x_ack),
         .xv_req(xv_req), .xv_we(xv_we), .xv_sel(xv_sel), .xv_addr(xv_addr),
@@ -244,11 +280,25 @@ module `M86_TOP (
     wire [3:0]  mem_sel;
     wire [26:0] mem_adr;
     wire [31:0] mem_dat_w, mem_dat_r;
-    m86_xclk #(.AW(24)) xm (
-        .a_clk(clk), .a_rst(rst), .a_req(m_req), .a_we(m_we),
-        .a_addr(m_addr), .a_wdata(m_wdata), .a_rdata(m_rdata), .a_ack(m_ack),
-        .b_clk(mclk), .b_rst(mrst), .b_stb(wb_stb), .b_we(wb_we),
-        .b_addr(wb_adr), .b_wdata(wb_dat_w), .b_rdata(mem_dat_r), .b_ack(wb_ack));
+    // (A cache line at a time, and the controller's block register
+    // read whole: rtl/soc/m86_xline.v. With -DM86_XLINE=0 the bridge
+    // of before round 40, a word at a time.)
+    wire [127:0] mem_blk;
+    wire         mem_blk_ok;
+    generate if (`M86_XLINE != 0) begin : gxl
+        m86_xline #(.AW(24)) xm (
+            .a_clk(clk), .a_rst(rst), .a_req(m_req), .a_we(m_we), .a_raw(m_raw),
+            .a_addr(m_addr), .a_wdata(m_wdata), .a_rdata(m_rdata), .a_ack(m_ack),
+            .b_clk(mclk), .b_rst(mrst), .b_stb(wb_stb), .b_we(wb_we),
+            .b_addr(wb_adr), .b_wdata(wb_dat_w), .b_rdata(mem_dat_r), .b_ack(wb_ack),
+            .b_blk(mem_blk), .b_blk_ok(mem_blk_ok));
+    end else begin : gxw
+        m86_xclk #(.AW(24)) xm (
+            .a_clk(clk), .a_rst(rst), .a_req(m_req), .a_we(m_we),
+            .a_addr(m_addr), .a_wdata(m_wdata), .a_rdata(m_rdata), .a_ack(m_ack),
+            .b_clk(mclk), .b_rst(mrst), .b_stb(wb_stb), .b_we(wb_we),
+            .b_addr(wb_adr), .b_wdata(wb_dat_w), .b_rdata(mem_dat_r), .b_ack(wb_ack));
+    end endgenerate
 
     // Video memory past the VGA's own 64 KB is in the DDR3 too, above
     // the 64 MB the machine uses: the VGA's CPU side through a bridge
@@ -290,13 +340,20 @@ module `M86_TOP (
     // Zeitlos's DDR3 memory: the 4 Gb part (MT41K256M16), of which
     // the machine uses the first 64 MB. Parameters as in Zeitlos's
     // rtl/boards.vh for this board.
-    ddr3 #(.ROW_BITS(15), .TRFC_NS(260), .WCOMBINE(0)) mem (
+    // (With the controller's write combining, -DM86_WCOMBINE=1, the
+    // four words of a line that the bridge writes one after the other
+    // are one DRAM write and not four. It is off: its logic is the
+    // longest path on the controller's 48 MHz clock, which it then
+    // meets on some placements and misses on others, and it saves
+    // little: docs/soc.md.)
+    ddr3 #(.ROW_BITS(15), .TRFC_NS(260), .WCOMBINE(`M86_WCOMBINE)) mem (
         .clk_i(mclk), .rst_i(mrst),
         .eclk_i(eclk), .ddrdel_i(ddrdel), .pause_i(ddr_pause),
         .phy_rst_i(phy_rst), .phy_ready_i(phy_ready), .pll_locked_i(mem_locked),
         .wb_adr_i(mem_adr), .wb_dat_i(mem_dat_w), .wb_dat_o(mem_dat_r),
         .wb_we_i(mem_we), .wb_sel_i(mem_sel), .wb_stb_i(mem_stb),
         .wb_cyc_i(mem_stb), .wb_ack_o(mem_ack),
+        .blk_dat_o(mem_blk), .blk_ok_o(mem_blk_ok),
         .reg_adr_i(rg_adr), .reg_dat_i(rg_dat_w), .reg_dat_o(rg_dat_r),
         .reg_we_i(rg_we), .reg_stb_i(rg_stb), .reg_cyc_i(rg_stb),
         .reg_ack_o(rg_ack),
@@ -368,7 +425,11 @@ module pll_video (
         .CLKOS_CPHASE(2),
         .CLKOS_FPHASE(0),
         .CLKOS2_ENABLE("ENABLED"),
-        .CLKOS2_DIV(19),
+`ifdef M86_CPU_C
+        .CLKOS2_DIV(`M86_C_DIV),
+`else
+        .CLKOS2_DIV(19),            // 630 / 19 = 33.16 MHz
+`endif
         .CLKOS2_CPHASE(2),
         .CLKOS2_FPHASE(0),
         .FEEDBK_PATH("CLKOP"),

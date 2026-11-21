@@ -682,6 +682,11 @@ static void port_write8(pc *p, uint16_t port, uint8_t v)
     case 0x40: case 0x41: case 0x42: case 0x43:
         pit_write(p, port & 3, v);
         break;
+    case 0xF0:                          /* the FPU's error is seen: go on (IGNNE) */
+        p->cpu.ignne = p->cpu.ferr;
+        p->pic[1].irr &= (uint8_t)~0x20;
+        pic_update(p);
+        break;
     case 0x60: kb_write_data(p, v); break;
     case 0x61:
         p->port61 = (uint8_t)((p->port61 & 0x10) | (v & 0x0F));
@@ -914,6 +919,11 @@ void pc_run(pc *p, uint64_t n)
             }
         } else {
             m86_step(c);
+            /* The FPU's error line is interrupt 13 (as a PC wires a
+             * 486's FERR): once for each time it rises. */
+            if (c->ferr && !c->ignne && !p->ferr_was)
+                raise_irq(p, 13);
+            p->ferr_was = c->ferr && !c->ignne;
         }
         pc_devices(p, steps);
         n = n > steps ? n - steps : 0;

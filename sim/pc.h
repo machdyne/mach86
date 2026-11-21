@@ -53,6 +53,7 @@ typedef struct {
 } pc_sd;
 
 typedef struct pc {
+    int ferr_was;       /* the FPU's error line, last time it was looked at */
     m86      cpu;
     uint8_t *ram;
     uint8_t  rom[0x20000];              /* the BIOS, ending at FFFFFh */

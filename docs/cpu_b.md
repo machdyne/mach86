@@ -689,13 +689,240 @@ now, since no other user is at work in a cycle a micro-operation
 runs. Sergei routes at 34.6 MHz for the 33.16 MHz target (33.9 in
 round 31).
 
+### Round 38
+
+**A profile by cause, to decide what to build next.** Design C is
+slower than design B ([cpu_c.md](cpu_c.md)), so the question was
+whether to go on with a pipeline at all, and in what form. The
+lockstep bench now puts every cycle of design B in one class by what
+it was spent on, and looks at every micro-operation for what a
+pipelined engine would have to wait for
+([verification.md](verification.md#where-the-cycles-go)). No change
+to the design: two wires that only the simulation reads.
+
+The measure is 89 million instructions of DOOM (demo play with a
+level's load in it), 1.885 cycles an instruction, the memory
+answering at once:
+
+| What the cycle was spent on | Cycles an instruction | Share |
+|---|---:|---:|
+| Running an instruction's first micro-operation | 0.962 | 51.0% |
+| A load's first cycle, the address (the data comes in the second) | 0.322 | 17.1% |
+| Decoding: 3.8% of instructions are not in the cache | 0.168 | 8.9% |
+| A shift's two extra cycles | 0.156 | 8.3% |
+| Micro-operations after the first, from the ROM | 0.146 | 7.7% |
+| Waiting for the ROM's first word | 0.058 | 3.1% |
+| Dividing | 0.026 | 1.4% |
+| Looking for cached code beside a store | 0.023 | 1.2% |
+| A jump to a computed address (a return, mostly) | 0.018 | 1.0% |
+| A multiply's two extra cycles | 0.007 | 0.4% |
+
+An instruction is 1.11 micro-operations. A taken jump costs nothing
+in this design (the cache is read at the target in the cycle the
+jump is decided) and there are 0.12 of them an instruction.
+
+**What other engines would take for the same instructions,** from
+the same run:
+
+| | Cycles an instruction | Against design B |
+|---|---:|---:|
+| Design B | 1.885 | |
+| ... with the next micro-operation begun in a load's second cycle, unless it needs what is loaded (36% do) | 1.679 | 12% faster |
+| ... and with shifts of one cycle | 1.523 | 24% faster |
+| A pipeline (address, memory, ALU stages) with a jump predictor, three cycles lost by a wrong prediction | 1.48 | 27% faster at the same clock |
+| The same with no predictor: every taken jump loses three cycles | 1.83 | 3% faster at the same clock |
+
+The pipeline's figure keeps design B's cost for decoding, the ROM,
+dividing and the search beside stores, takes away the load's and the
+shift's extra cycles, and adds what a pipeline waits for: an address
+made of what the micro-operation before computed (1.9% of
+instructions, two cycles), or loaded (0.3%, one), or of what the one
+before that computed (1.8%, one). The predictor is a two-bit counter
+and a last target in each of the instruction cache's 2,048 entries
+and a stack of eight return addresses: it is wrong for 3.9% of
+conditional jumps, 1.3% of returns, 0.5% of all instructions. The
+figure leaves out whatever else a real pipeline would stall on, so
+it is a lower bound.
+
+**What it says.**
+
+1. **A pipeline would not need fewer cycles than design B can reach
+   with two changes** (1.48 against 1.52). Everything a pipeline
+   could add is in its clock: 45 to 50 MHz against 33 would be 40 to
+   55% more than the improved design B, if that clock is reached.
+2. **Without a jump predictor a pipeline gains nothing** over design
+   B as it is: design B's free jumps are worth as much as its
+   two-cycle loads cost.
+3. **The two changes are the first things to do either way.** The
+   load's overlap is a pipeline stage in all but name (a second
+   write to the registers in one cycle, and the next micro-operation
+   held when it needs the load): it is the first step of any
+   pipeline and is useful without the rest.
+
+The DOS boot and test (40 million instructions, 2.64 cycles an
+instruction) is another kind of work: it is DOS calls, and an
+instruction there is 1.64 micro-operations. Microcode after the
+first micro-operation is 0.68 cycles an instruction, loads' first
+cycles 0.52, the search beside stores 0.18, decoding 0.16. The
+load's overlap would take it to 2.34 and a pipeline to 2.26: for
+that kind of work the gain is in shorter microcode for `INT`,
+`IRET`, `PUSHA`, `POPA` and the loads of segment registers, not in
+the engine.
+
+### Round 39
+
+**The two changes round 38's profile pointed at, in a form that fits
+Lakritz.** DOOM (the same 89 million instructions) went from 1.885
+cycles an instruction to 1.719: **9.6% faster at the same clock.**
+The DOS boot and test, which is mostly microcode, gained 2%.
+
+**Shifts take two cycles, not three.** The shifter is the
+multiplier, with a register before it and one after. A shift now
+takes the product as it leaves the multiplier, in the cycle after
+its operands were registered; a multiply still takes it from the
+register a cycle later, because its result goes on through an adder
+and a comparison. No logic was added and 64 flip-flops went. In
+DOOM: 0.156 cycles an instruction down to 0.078.
+
+**A load no longer holds up the instruction after it.** A load that
+is a whole instruction (`MOV reg, mem`, `MOVZX`, `POP`, `LODS`) is
+over in its first cycle as far as the order of instructions goes:
+the address is on its way to the bus and the next instruction's
+cache entry is being read. What is left, the data and its way into
+the register, is kept in a few flip-flops (`lp_*`) and done in the
+next cycle, beside the next instruction's first micro-operation.
+That micro-operation waits a cycle, as before, when
+
+- the data is not there yet (the cache missed);
+- it reads the register being loaded;
+- it would write a register in that cycle itself (a result, or a
+  pointer it moves: the register file has one write port);
+- it is the first of several and changes something in its first
+  cycle, or loads a segment register.
+
+Paging turns all of it off: with paging on a load is as it was.
+
+In DOOM 0.202 instructions in every one are such loads, and for 44%
+of them the instruction after can go ahead (of the rest: 16% need
+the loaded value, 14% move a pointer, 14% write a result, 13% are
+longer instructions). Chains of loads now run one a cycle.
+Interrupts are taken a little differently: one that arrives during
+a load's second cycle is taken after the instruction that has begun
+beside it, not before.
+
+Round 38's estimate for the two changes was 1.52 cycles an
+instruction, and said it was an upper bound. What it did not count:
+shifts in one cycle would need a shifter of some 400 LUTs beside the
+multiplier, which Lakritz has not got, and the estimate let every
+load go ahead that was not needed by its neighbour, where the one
+write port stops a third of those, and it counted the loads inside
+longer instructions and the load-and-operates (`ADD reg, mem`),
+whose second cycle needs the ALU itself.
+
+**What it costs.** On Lakritz 58 logic cells (23,603 of 24,288; 685
+are left). The clock took the work. The first form put the memory's
+answer, and a look at the next micro-operation's registers, in front
+of everything a micro-operation does, and the Sergei build failed
+its clock on two seeds of four. Three paths were taken out again:
+the microcode's own address and jumps do not wait for a pending
+load (there is none while microcode runs, but the tools cannot
+know); the adder's sum is still the last thing chosen for the
+register file; and a read is announced to the memory before it is
+known whether the micro-operation must wait for the load (the memory
+drops an announced read that does not come). With today's tools the
+round 38 design routed at 33.9 MHz on the Sergei (one seed) and
+36.8 on Lakritz; this one at 33.6 to 34.7 (three seeds) and 33.6 to
+34.7 (three seeds), for 33.16. The builds use the best seed of
+each. It is not more margin than there was, and on Lakritz it is
+less: see [boards.md](boards.md#lakritz-where-it-stands).
+
+**What is left in DOOM,** in cycles an instruction, of 1.719: 0.96
+first micro-operations; 0.17 decoding; 0.15 microcode after the
+first micro-operation; 0.12 first cycles of loads that are not whole
+instructions or are load-and-operates; 0.12 waiting behind a load
+for the reasons above; 0.08 shifts; 0.06 waiting for the ROM. An
+experiment in the bench with other ways of choosing a cache entry
+(the address's low bits XOR-ed with the bits above them) says they
+would miss more often, not less (4.1% of instructions against
+3.7%); 4,096 entries would miss 2.1%, and cost 21 block RAMs that
+neither board has.
+
+### Round 40
+
+**Shifts in one cycle, and what is not needed for DOOM made a build
+option.** DOOM's 89 million instructions take 1.661 cycles each
+(1.885 in round 38, 1.719 in round 39): 13.5% faster than round 38
+at the same clock. The larger gain of the round is outside the
+core, in the memory ([soc.md](soc.md#the-main-memory)).
+
+**The shifter is a shifter.** Until now a shift was a multiplication
+by a power of two, in the multiplier, registered before and after
+(three cycles; two in round 39, with the output register left out).
+Now it is a rotation by 0 to 31 places in five layers of
+multiplexers, with a mask that says which of its bits are the low
+half of the old product and which the high half; everything after
+that — which half a shift takes, the double shifts' second operand,
+the flags — is as it was, so the results are the same by
+construction, and the 386 vectors pass. What it took to make it
+fit a cycle:
+
+- **How far to rotate is worked out when the cache entry is made.**
+  For a shift to the right it is 32 less the count, and that
+  subtraction stood between the cache and the rotation. It is kept
+  in bits 12-8 of the entry's immediate, which a shift does not use.
+- **A count in a register is registered first:** `SHL reg, CL` and
+  its kin take two cycles. They are 1% of DOOM's shifts.
+- **The operand is not sign-extended before the rotation** for 8-
+  and 16-bit arithmetic shifts; the sign is filled in after it, by
+  the mask moved down.
+- **The result joins the data for the register file one choice
+  before the end,** not through the multiplexer of all the units'
+  results.
+- **The zero flag is found beside the result, not from it:** for
+  each of the parts the result is put together from, whether it is
+  zero (an OR is zero when both its sides are).
+
+It costs about 450 logic cells and gives back four of the nine
+multiplier blocks (the second multiplier, for the double shifts, is
+gone). The multiplier is now the multiply's alone.
+
+**The core's options** (parameters of `m86b_core`, set by the board
+file):
+
+| | | Lakritz | Sergei ML2 |
+|---|---|---|---|
+| `VMEM` | Paging, virtual 8086 mode and the I/O permission bitmap. Without: CR0's PG bit and EFLAGS' VM bit do nothing, and a port above the I/O privilege level is a general protection fault | **0** | 1 |
+| `WIN` | The decoder's window ([round 32](#the-decoders-window)) | **1** (0 until now) | 1 |
+| `OVL` | A load lets the next instruction start ([round 39](#round-39)) | 1 | 1 |
+
+DOS, DOS/4GW and DOOM use none of what `VMEM` holds: DOOM ran in
+round 26, before any of it existed, and runs in lockstep on the core
+built without it (the whole 664 million steps to the end of the
+profile's stretch). A memory manager like Jemm386 needs all of it,
+so on Lakritz there is none; `make lakritz LAK_DEFS=-DM86_VMEM=1
+-DM86_WIN=0` builds the old choice. Leaving it out is worth about
+2,000 cells on Lakritz, which paid for the window and the shifter
+and left room: see [boards.md](boards.md#lakritz-where-it-stands).
+
+**The clock.** The shifter is now among the longest ways through
+the core, beside the adder's: Lakritz routes at 33.8 to 35.1 MHz
+over three seeds and the Sergei at 34.0, for 33.16. That is no more
+margin than round 39 had, for all the room on Lakritz; round 38's
+design, with its three-cycle shifts, made 36.8 on Lakritz on the one
+seed it was built with.
+
+**Where DOOM's cycles go now,** an instruction: 0.96 first
+micro-operations; 0.17 decoding; 0.15 microcode after the first
+micro-operation; 0.13 waiting behind a load; 0.12 first cycles of
+loads that cannot be overlapped; 0.06 waiting for the ROM; 0.07
+everything else.
+
 ## Known limits
 
-1. **Lakritz is full.** All 56 block RAMs are used, and all but a
-   few hundred LUTs: the decoder's window ([round 32](#round-32)) is
-   left out there. The microcode ROM has room (1,417 of 2,048 words
-   used), but anything else that wants a block has to take it from
-   something.
+1. **Lakritz has no paging, virtual 8086 mode or I/O permission
+   bitmap** since round 40 (`VMEM = 0`): they were what filled it.
+   All 56 block RAMs are still used, so anything that wants a block
+   has to take it from something.
 2. **Self-modifying code** is handled exactly, but two windows
    remain. A store takes effect on the cache at the end of the
    instruction that makes it, so an instruction that overwrites the

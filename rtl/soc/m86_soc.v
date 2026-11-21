@@ -54,7 +54,15 @@ module m86_soc #(
     parameter ROM3 = "rom3.hex",
     parameter UCODE = "ucode.hex",
     parameter ATTR  = "attr.hex",
+    parameter CPU_C = 0,            // the processor: 0 design B, 1 design C (the 45F boards)
+    parameter CPU_DC_AW = 11,       // design C's cache: 2^n entries
+    parameter CPU_FPU = 0,          // design C: with the floating-point unit (the microcode must be made for it)
+    parameter CPU_FAST = 1,         // design C: with its pipeline
+    parameter CACHE_LATE = CPU_C,   // the memory cache's hit from a register (m86_dcache.v)
+    parameter CPU_PH = 3,           // design C: clocks for each cycle of its three-clock part
     parameter CPU_WIN = 1,          // the CPU decoder's window (m86b_core.v): 0 on Lakritz, for want of LUTs
+    parameter CPU_VMEM = 1,         // design B: paging, virtual 8086 mode, the I/O permission bitmap (0: without)
+    parameter CPU_OVL = 1,          // design B: a load lets the next instruction start beside its second cycle
     parameter KBD_WAIT = 8192,
     parameter FONT = "font.hex",
     parameter HDMI_DEF = 1'b0          // port 1E1h bit 0 at power-on
@@ -120,6 +128,9 @@ module m86_soc #(
     output wire [31:0]       m_wdata,
     input  wire [31:0]       m_rdata,
     input  wire              m_ack,
+    // The request is the BIOS's memory port's, not the cache's: single
+    // words that must each reach the memory (rtl/soc/m86_xline.v).
+    output wire              m_raw,
     // The memory controller's own registers, the same way.
     output wire        x_req,
     output wire        x_we,
@@ -176,7 +187,42 @@ module m86_soc #(
     wire        irq, inta;
     wire [7:0]  irq_vec;
 
-    m86b_core #(.UCODE(UCODE), .ATTR(ATTR), .WIN(CPU_WIN)) cpu (
+    wire [31:0] cpu_insns /*verilator public_flat_rd*/;
+    wire [23:0] cpu_dbg /*verilator public_flat_rd*/;      // design C's pipeline state (m86c_core.v)     // instructions run (for test benches)
+    // The processor: design B (docs/cpu_b.md), or with CPU_C design C
+    // (docs/cpu_c.md), which has the same pins.
+    // (Design C looks at the interrupt line in the cycle it comes; from
+    // the interrupt controller's logic that is too long a way at its
+    // clock, so it gets the line a cycle late.)
+    // The floating-point unit's error line is interrupt 13, once each
+    // time it rises; a write to port F0h (the BIOS's handler makes one)
+    // says the error has been seen, until the unit's flags are cleared.
+    wire cpu_ferr;
+    reg  ferr_q, ignne;
+    wire irq13 = cpu_ferr && !ignne && !ferr_q;
+    always @(posedge clk) begin
+        ferr_q <= cpu_ferr && !ignne;
+        if (sys_rst || !cpu_ferr)
+            ignne <= 1'b0;
+        else if (d_req && d_io && d_wr && d_addr[15:0] == 16'h00F0)
+            ignne <= 1'b1;
+    end
+    reg irq_q;
+    always @(posedge clk) irq_q <= irq && !sys_rst;
+    generate if (CPU_C != 0) begin : gc
+        m86c_core #(.UCODE(UCODE), .ATTR(ATTR), .WIN(CPU_WIN), .DC_AW(CPU_DC_AW), .PH(CPU_PH), .FAST(CPU_FAST), .FPU(CPU_FPU)) cpu (
+        .clk(clk), .rst(sys_rst),
+        .d_req(d_req), .d_wr(d_wr), .d_addr(d_addr), .d_size(d_size),
+        .d_wdata(d_wdata), .d_rdata(d_rdata), .d_ack(d_ack_cpu), .d_st_rdy(d_st_rdy),
+        .e_req(e_req), .e_addr(e_addr), .e_size(e_size),
+        .d_io(d_io), .x_rd(x_rd),
+        .dma_req(dma_req), .dma_addr(dma_addr), .dma_ack(dma_ack), .dma_q(dma_q),
+        .slow(slow), .irq(irq_q), .irq_vec(irq_vec), .inta(inta),
+        .halted(halted), .step_done(), .last_exc(last_exc), .dbg_insns(cpu_insns), .dbg_pipe(cpu_dbg), .ferr(cpu_ferr));
+    end else begin : gb
+        assign cpu_dbg = 24'd0;
+        assign cpu_ferr = 1'b0;
+        m86b_core #(.UCODE(UCODE), .ATTR(ATTR), .WIN(CPU_WIN), .VMEM(CPU_VMEM), .OVL(CPU_OVL)) cpu (
         .clk(clk), .rst(sys_rst),
         .d_req(d_req), .d_wr(d_wr), .d_addr(d_addr), .d_size(d_size),
         .d_wdata(d_wdata), .d_rdata(d_rdata), .d_ack(d_ack_cpu), .d_st_rdy(d_st_rdy),
@@ -184,7 +230,8 @@ module m86_soc #(
         .d_io(d_io), .x_rd(x_rd),
         .dma_req(dma_req), .dma_addr(dma_addr), .dma_ack(dma_ack), .dma_q(dma_q),
         .slow(slow), .irq(irq), .irq_vec(irq_vec), .inta(inta),
-        .halted(halted), .step_done(), .last_exc(last_exc), .dbg_insns());
+        .halted(halted), .step_done(), .last_exc(last_exc), .dbg_insns(cpu_insns));
+    end endgenerate
 
     // A read of the AdLib's status takes a microsecond and a half, as
     // it does through an ISA bus. Programs count on it: the usual way
@@ -250,7 +297,7 @@ module m86_soc #(
             assign cm_wdata = 32'd0;
         end else begin : g_main
             assign ram_q = 32'd0;
-            m86_dcache #(.AW(MEM_AW), .LINE_BITS(CACHE_LINE_BITS)) cache (
+            m86_dcache #(.AW(MEM_AW), .LINE_BITS(CACHE_LINE_BITS), .LATE(CACHE_LATE)) cache (
                 .clk(clk), .rst(sys_rst),
                 .req(d_req && is_main), .wr(d_wr), .addr(fa[MEM_AW-1:0]),
                 .size(d_size), .wdata(d_wdata),
@@ -274,6 +321,7 @@ module m86_soc #(
     reg [31:0] mp_addr, mp_data;
     reg        mp_busy, mp_wr, mp_reg;
     assign mp_mem = mp_busy && !mp_reg;
+    assign m_raw   = mp_mem;
     assign m_req   = mp_mem ? 1'b1 : cm_req;
     assign m_we    = mp_mem ? mp_wr : cm_we;
     assign m_addr  = mp_mem ? mp_addr[MEM_AW-3:0] : cm_addr;
@@ -353,7 +401,7 @@ module m86_soc #(
     m86_pic pic (
         .clk(clk), .rst(sys_rst), .cs_m(cs_pic_m), .cs_s(cs_pic_s), .a0(port[0]),
         .wr(io_wr), .wdata(io_wd), .rdata(pic_q),
-        .req({3'd0, irq12, 4'd0, irq7, 5'd0, irq1, irq0}), .irq(irq), .inta(inta), .vec(irq_vec));
+        .req({2'd0, irq13, irq12, 4'd0, irq7, 5'd0, irq1, irq0}), .irq(irq), .inta(inta), .vec(irq_vec));
 
     // Timer: 1,193,182 ticks a second, made from the system clock.
     reg [31:0] pit_acc;

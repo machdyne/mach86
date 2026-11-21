@@ -60,6 +60,7 @@ rest as FAT32 (D:), where your own programs and CD images go
 
 ```
 make sergei_ml2           # output/sergei_ml2/mach86.bit
+make sergei_ml2_c         # output/sergei_ml2_c/mach86.bit: design C, 39.4 MHz (docs/cpu_c.md)
 make lakritz              # output/lakritz/mach86.bit
 ```
 

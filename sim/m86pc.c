@@ -219,6 +219,10 @@ int main(int argc, char **argv)
             if (f) fclose(f);
             font_loaded = (n == 4096);
         }
+        else if (!strcmp(a, "-fpu")) {          /* a 486DX: with the floating-point unit */
+            machine.cpu.has_fpu = 1;
+            m86_reset(&machine.cpu);
+        }
         else if (!strcmp(a, "-debug")) machine.debug_out = stderr;
         else if (!strcmp(a, "-profile")) profile = 1;
         else if (!strcmp(a, "-where")) where = 1;

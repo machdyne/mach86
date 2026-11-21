@@ -151,6 +151,11 @@ reproducible to the instruction.
 Not modelled: graphics, sound, DMA, serial ports, and a diskette
 controller (Mach86 has none; see below).
 
+With `-fpu` the processor is a 486DX: the x87 floating-point unit is
+there ([fpu.md](fpu.md)), its error line is interrupt 13 and port F0h
+lets it go on, as in a PC. Without the option it is the 486SX of the
+boards' bitstreams.
+
 ## Running the machine
 
 ```
@@ -183,6 +188,36 @@ instructions how often a decoded-instruction cache of several
 shapes would have missed (2,048, 4,096 and 8,192 entries; two ways
 of 1,024; and three ways of mixing higher address bits into the
 index, all of which do worse than the plain index).
+
+### Looking at what a program does
+
+`M86_PIPE=1` counts, beside the execution, the clock cycles a
+pipelined core would need for it: the pipeline planned as design C
+([cpu_c.md](cpu_c.md)). It is a count only, in `sim/m86pipe.h`,
+which describes what it charges for; the model's behaviour does not
+change. It prints the cycles an instruction and where they went
+(waits for an address, jumps guessed wrong, instructions not in the
+decoded-instruction cache, kinds that go through the pipeline
+alone) when the program ends.
+
+| Variable | Meaning | If not given |
+|---|---|---|
+| `M86_PIPE=n` | count from the n-th instruction | (1: from the start) |
+| `M86_PIPE_N=m` | count m instructions, then report | to the end |
+| `M86_PIPE_DC=bits` | the cache has 2^bits entries | 11 |
+| `M86_PIPE_SHIFT=1` | shifts of a register are in the pipeline | they go alone |
+| `M86_PIPE_MISS=c` | cycles for an instruction not in the cache | 10 |
+| `M86_PIPE_PH=k` | a kind that goes alone takes k times design B's cycles | 1 |
+| `M86_PIPE_SER=c` | cycles more than design B's for a kind that goes alone | 3 |
+
+DOOM's play in the model's run from the boot card is from about
+instruction 680 million on:
+
+```
+M86_PIPE=700000000 M86_PIPE_N=60000000 M86_PIPE_SHIFT=1 M86_PIPE_DC=12 \
+  output/sim/m86pc -bios output/bios/bios.bin -disk card.img \
+  -expect "C:\>" -type "d:\r" -type "doom -nosound\r" -run 760000000
+```
 
 `-expect` runs until the text appears on a screen row that changed
 since the previous step, and the exit status says whether every

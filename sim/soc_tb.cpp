@@ -50,6 +50,7 @@ static std::string console;
 static int quiet;
 static unsigned long card_mb;
 static long trace_left;
+static unsigned long long dbg_ring[16];       /* the last cycles: pipeline state, bus */
 
 /* ---- the card on the SPI pins ---- */
 static int spi_prev_sck, spi_bits;
@@ -295,6 +296,10 @@ static void cycle(void)
                 top->dbg_wr ? top->dbg_wdata : top->dbg_rdata);
         trace_left--;
     }
+    dbg_ring[cycles & 15] = ((unsigned long long)top->rootp->m86_soc__DOT__cpu_dbg << 40) |
+                            ((unsigned long long)top->dbg_req << 36) | ((unsigned long long)top->dbg_wr << 35) |
+                            ((unsigned long long)top->dbg_ack << 34) |
+                            top->dbg_addr;
     if (!top->halted) busy_cycles++;
     top->clk = 1;
     top->vclk = 1;                      /* the pixel clock: any rate will do */
@@ -530,7 +535,7 @@ int main(int argc, char **argv)
 #endif
 #ifdef SOC_RTL
     {
-        unsigned long long n = top->rootp->m86_soc__DOT__cpu__DOT__dbg_insns;
+        unsigned long long n = top->rootp->m86_soc__DOT__cpu_insns;
         fprintf(stderr, "\nsoc_tb: %llu instructions in %llu cycles not halted: "
                 "%.2f cycles per instruction", n, busy_cycles,
                 n ? (double)busy_cycles / (double)n : 0.0);
@@ -539,6 +544,17 @@ int main(int argc, char **argv)
     if (mem_reads)
         fprintf(stderr, "\nsoc_tb: main memory: %llu words read, %llu written",
                 mem_reads, mem_writes);
+    /* The bus as it stands (when a run has stopped making progress). */
+    if (!ok)
+        fprintf(stderr, "soc_tb: the bus at the end: req %d wr %d io %d ack %d size %d addr %08x; pipeline %06x\n",
+                top->dbg_req, top->dbg_wr, top->dbg_io, top->dbg_ack, top->dbg_size, top->dbg_addr,
+                (unsigned)top->rootp->m86_soc__DOT__cpu_dbg);
+    if (!ok)
+        for (int k = 1; k <= 16; k++) {
+            unsigned long long v = dbg_ring[(cycles + k) & 15];
+            fprintf(stderr, "soc_tb:   pipeline %06llx  req %llu wr %llu ack %llu addr %08llx\n",
+                    v >> 40, (v >> 36) & 1, (v >> 35) & 1, (v >> 34) & 1, v & 0xFFFFFFFFull);
+        }
     fprintf(stderr, "\nsoc_tb: %llu cycles (%.2f s at %d MHz), last fault %02x%s\n",
             cycles, (double)cycles / CLK_HZ, CLK_HZ / 1000000, top->last_exc,
             ok ? "" : ": FAILED");

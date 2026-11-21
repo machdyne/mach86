@@ -4,12 +4,23 @@
  */
 #include <stdlib.h>
 #include <cstring>
+#ifdef CORE_C
+/* Design C: the same ports and signals. */
+#include "Vm86c_core.h"
+#include "Vm86c_core___024root.h"
+#define Vm86b_core Vm86c_core
+#else
 #include "Vm86b_core.h"
 #include "Vm86b_core___024root.h"
+#endif
 #include "vectest.h"
 
 static Vm86b_core *top;
+#ifdef CORE_C
+#define R(sig) top->rootp->m86c_core__DOT__##sig
+#else
 #define R(sig) top->rootp->m86b_core__DOT__##sig
+#endif
 
 static void cycle(void)
 {
