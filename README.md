@@ -146,6 +146,10 @@ files are third-party and are fetched, not committed
 RTL core, and `make synth` reports its size
 ([docs/cpu.md](docs/cpu.md)).
 
+## LLM-generated code
+
+This project makes use of LLMs for code and documentation.
+
 ## License
 
 The contents of this repo are released under the
